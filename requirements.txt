@@ -1,0 +1,11 @@
+numpy>=2.0
+pandas>=2.2
+baostock>=0.8.9
+akshare>=1.17
+pypdf>=5
+pdfplumber>=0.11
+langgraph>=1.2
+langgraph-checkpoint-sqlite>=3.1
+pytest>=8
+pyqlib>=0.9.7
+scikit-learn>=1.3  # Qlib 模型训练：LightGBM 加载不了时的梯度提升树
