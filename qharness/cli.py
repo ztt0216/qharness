@@ -424,6 +424,9 @@ def main(argv=None):
     rp.add_argument("--no-screen", action="store_true", help="fetch：不调用模型预筛")
     rp.add_argument("--llm", choices=["anthropic", "openai"], default="anthropic")
     rp.add_argument("--env-file")
+    er = sub.add_parser("eval-retrieval", help="检索评测：字面 / 语义 / 混合在真实运行记录上的对比")
+    er.add_argument("--no-llm", action="store_true", help="不跑改写查询那组（要调用模型）")
+    er.add_argument("--out", default=str(ROOT / "runs" / "retrieval_eval.json"))
     sv = sub.add_parser("serve", help="本地前端：运行记录、审计轨迹、因子库、模型、模拟账户；可发起研究运行")
     sv.add_argument("--host", default="127.0.0.1")
     sv.add_argument("--port", type=int, default=8765)
@@ -494,6 +497,11 @@ def main(argv=None):
 
     if args.cmd == "qlib-dump":
         return cmd_qlib_dump(Path(args.data), Path(args.out))
+    if args.cmd == "eval-retrieval":
+        from .retrieval_eval import run as eval_retrieval
+        res = eval_retrieval(ROOT / "runs", Path(args.out), None if args.no_llm else make_llm("anthropic"))
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return res
     if args.cmd == "reports":
         return cmd_reports(args)
     if args.cmd == "serve":

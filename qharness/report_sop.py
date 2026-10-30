@@ -11,6 +11,7 @@ from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from . import retrieval
 from .experience import similarity
 from .llm import LLM, extract_json
 from .trace import Tracer
@@ -189,7 +190,8 @@ class ReportSOP:
                      {"summary_text": summary_text})
         self.tr.log("sop.topic", output=topic)
         query = json.dumps(topic, ensure_ascii=False)
-        return {"topic": topic, "body": sorted(s["body"], key=lambda c: -similarity(query, c["text"]))}
+        order = retrieval.rank(query, [c["text"] for c in s["body"]])
+        return {"topic": topic, "body": [s["body"][i] for i in order]}
 
     def _n_viewpoints(self, s):
         """观点提取：按主题相关度取正文块，逐块抽取，每条带出处；论据必须能在本块原文找到。"""
@@ -217,7 +219,7 @@ class ReportSOP:
         for v in (Viewpoint(**d) for d in s["raw"]):
             target = None
             for m in merged:
-                if similarity(v.claim, m.claim) < 0.3:
+                if not retrieval.maybe_same(v.claim, m.claim):  # 初筛（字面；混合模式下加语义通道），再由模型确认
                     continue
                 if _ask(self.llm, "sop.same_claim",
                         f"两条判断是否是同一个观点（方向相反不算）？输出 {{\"same\": true/false}}\nA：{m.claim}\nB：{v.claim}",
@@ -250,7 +252,7 @@ class ReportSOP:
         formulas = {m.group(1): m.group(0) for m in re.finditer(r"【公式】([A-Za-z][A-Za-z0-9_]*)：[^\n]*", s["text"])}
         blob = " ".join(texts)
         out = [f for k, f in formulas.items() if re.search(rf"(?<![A-Za-z0-9]){re.escape(k)}(?![A-Za-z0-9])", blob)]
-        ranked = sorted(s["body"], key=lambda c: -similarity(blob, c["text"]))[:2]
+        ranked = [s["body"][i] for i in retrieval.rank(blob, [c["text"] for c in s["body"]])[:2]]
         return out + [f"（{c['section']} 第{c['page']}页）{c['text'][:400]}" for c in ranked]
 
     def _n_hypothesis(self, s):

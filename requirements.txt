@@ -13,3 +13,4 @@ fastapi>=0.115  # 本地前端的后端（qharness serve）
 uvicorn>=0.30
 python-multipart>=0.0.9  # 上传研报
 httpx>=0.27  # 测试用 FastAPI TestClient
+fastembed>=0.9  # 向量检索（bge-small-zh-v1.5，本地 ONNX，不需要 PyTorch）；可选，默认用字面检索

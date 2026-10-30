@@ -861,3 +861,29 @@ def test_report_inbox_scan_dedup_and_screen(tmp_path):
     os.utime(inbox / "还在下载.pdf", (old, old))
     r2 = rf.scan_inbox(idx, inbox)  # 再扫：之前的不重复，刚才没写完的这次进来
     assert len(r2["added"]) == 1 and r2["skipped"] == 2
+
+
+def test_retrieval_modes(monkeypatch):
+    """默认字面检索（与改动前排序一致）；关掉向量模型时混合模式退回字面；混合模式下语义通道能召回换了说法的同一观点。"""
+    from qharness import retrieval as R
+    from qharness.experience import similarity
+
+    q = "过去20日收盘价与成交量相关性高的个股后续表现更好"
+    texts = ["凝血因子产品快速放量", "收盘价与成交量的20日相关系数越高，个股未来收益越高", "短期动量延续"]
+    monkeypatch.delenv("QH_RETRIEVAL", raising=False)
+    assert R.mode() == "lexical"
+    assert R.rank(q, texts) == sorted(range(3), key=lambda i: -similarity(q, texts[i]))
+    monkeypatch.setenv("QH_RETRIEVAL", "nonsense")
+    with pytest.raises(ValueError):
+        R.mode()
+    monkeypatch.setenv("QH_RETRIEVAL", "hybrid")
+    monkeypatch.setenv("QH_EMBED", "off")
+    assert R.mode() == "lexical" and R.rank(q, texts) == R.rank(q, texts, how="lexical")
+    monkeypatch.delenv("QH_EMBED")
+    if not R.enabled():
+        pytest.skip("没有本地向量模型（python -m qharness.retrieval --download）")
+    assert R.rank(q, texts, how="semantic")[0] == 1 and R.rank(q, texts, how="hybrid")[0] == 1
+    a, b = "低波动股票长期跑赢", "波动率小的个股未来收益更高"
+    assert similarity(a, b) < 0.3 and R.maybe_same(a, b)            # 字面过不了线，语义通道召回
+    monkeypatch.setenv("QH_RETRIEVAL", "lexical")
+    assert not R.maybe_same(a, b)

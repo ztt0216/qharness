@@ -60,6 +60,7 @@ QH_ENV_FILE=path/to/.env .venv/bin/python -m qharness serve
 | `paper-sim` | 模拟账户历史回放（默认测试段），输出净值、成交记录，并和同区间回测对照 | `runs/paper_sim/` |
 | `reports fetch` / `list` / `run` | 自动找研报：东方财富策略类研报列表 → 标题筛选 → 下载 PDF → 程序和模型预筛 → 研究（`fetch --research N` 预筛完接着研究 N 篇） | `data/reports/auto/`：`index.json`、PDF |
 | `reports scan` / `watch` | 收件夹：自己下载的研报放进 `data/reports/inbox/`，扫描一次或持续监视（`--interval` 秒），新文件预筛后排队（`--research N` 接着研究） | 同上 |
+| `eval-retrieval` | 检索评测：字面 / 语义 / 混合三种方式在真实运行记录上对比（研报检索、改写查询、同一因子识别） | `runs/retrieval_eval.json` |
 | `serve` | 本地前端：研究运行的审计轨迹（出处跳回研报原文）、因子库、模型逐折结果、模拟账户；可上传研报发起研究、更新行情并结算 | — |
 | `factors` | 查看登记因子（代码、各段指标、来源 run） | — |
 | `eval-research` | 研究层评测集打分 | `runs/research_eval.json` |
@@ -205,6 +206,27 @@ baostock 并发太高会封 IP，东财接口会断连接，所以下载都是�
 - 扣掉费用后，样本外年化超额中位数 -2.7%：排序能力有，但不足以覆盖 5 天一调仓的换手成本。基线更差（-10.8%）。
 - 每一折的最优轮数都是第一次检查时的 20 棵树：验证段 L2 从一开始就上升，说明训练段学到的关系到验证段就衰减了。还没有用更细的早停步长或更强的正则去调，调了要再开一次测试段，会留下记录。
 
+### 检索：字面、语义向量、混合（`retrieval.py`）
+
+研报流程里有三处检索：按主题给正文段落排序、给假设生成找研报里的文字定义、观点归并时找可能是同一观点的候选（之后由模型确认）。
+
+- **字面**：英文词 + 中文二元组的余弦相似度。
+- **语义**：BAAI/bge-small-zh-v1.5，本地 ONNX（fastembed，91 MB，CPU 上编码一句约 2 毫秒），`python -m qharness.retrieval --download` 下载到 `data/models/`。
+- **混合**：两种排名用 RRF（倒数排名融合）合并，不需要把两种分数换算到同一尺度。观点归并初筛在字面之外加一条语义通道（语义相似度 ≥ 0.75 也送去确认）。
+
+用 `qharness eval-retrieval` 在已有运行记录上对比，标准答案都来自运行记录，不需要人工标注：
+
+| 任务 | 字面 | 语义 | 混合 |
+|---|---|---|---|
+| 研报检索：用归并后的观点找它出处那一段，Recall@2（16 篇研报、554 条观点，每篇平均 27.5 段） | **0.848** | 0.681 | 0.810 |
+| 同上，观点先由模型改写成不同措辞，Recall@2（80 条） | 0.744 | 0.631 | **0.756** |
+| 同一因子识别：61 个候选假设两两配对，因子身份相同算正例，AUC | **0.983** | 0.953 | 0.976 |
+
+- **结论**：在这个项目的数据上，语义向量没有带来提升。观点是从切片里抽出来的，措辞和原文接近；中文二元组对术语密集的研报已经很有效；检索都在一篇研报内部，候选只有二三十段；因子识别靠公式和窗口这类精确字眼，语义向量分不清「5 日反转」和「20 日反转」（相似度 0.88）。
+- **语义通道的代价**：同义改写的语义相似度实测 0.67~0.77，无关观点也常到 0.63~0.66。在一篇 47 条观点的研报上，阈值 0.7 会额外多 119 次模型确认（字面初筛才 47 次），0.8 只多 8 次但几乎召回不到改写，取 0.75（多 34 次）。
+- **所以**：默认用字面（`QH_RETRIEVAL=lexical`），`QH_RETRIEVAL=hybrid` 打开混合（端到端跑过示例研报，结论一致）；模型没下载或 `QH_EMBED=off` 时自动退回字面。经验检索和论据核对固定用字面：前者要分清数字，后者要的就是「论据逐字出自原文」，语义匹配会把改写甚至编造的论据也放过去。
+- 换更大的模型（bge-base、bge-m3）或加重排可能改善语义这一路，没有试。
+
 ### 自动找研报（`qharness reports`）
 
 `report_fetch.py`。完整跑一篇研报要 2~7 万 token，而能用日线验证的个股因子研报很少，所以重点是先便宜地筛掉跑不了的：
@@ -345,6 +367,7 @@ FastAPI（`qharness/web.py`）+ React（`web/`，Vite + TypeScript）。后端�
 | 方向由 Harness 施加 | `sandbox.with_direction`；实验层提示词不含 direction；只翻方向时跳过重新生成 | `test_direction_applied_by_harness`、`test_coder_does_not_see_direction` |
 | Qlib | `qlib_bridge.py`：数据转换、表达式白名单、和行情一致性检查、TopkDropout 回测复核 | `test_qlib_expression_matches_pandas`、`test_qlib_expression_static_rules`、`test_qlib_rejects_stale_data`、`test_qlib_backtest_runs`、`test_experiment_agent_uses_qlib_tool_real_model` |
 | Qlib 模型训练 | `qlib_model.py`：Alpha158 + 梯度提升树（LightGBM 不可用时 sklearn），Qlib workflow 记录，Harness 口径评估，测试段按配置加锁，调仓相位区间 | `test_qlib_model_train_alpha158`、`test_registry_exprs_keep_registered_direction` |
+| 检索 | `retrieval.py`：字面 / 语义 / 混合（RRF），默认按评测结果用字面；`retrieval_eval.py` 在运行记录上对比 | `test_retrieval_modes`、`qharness eval-retrieval` |
 | 自动找研报 | `report_fetch.py`：标题筛选、下载校验、程序和模型两道预筛（程序复核模型结论）、状态落盘 | `test_report_fetch_title_filter`、`test_report_fetch_pipeline_offline`、`test_report_inbox_scan_dedup_and_screen`、`test_web_api_reports_joins_runs` |
 | 前端 | `web.py`：只读接口 + 白名单任务（研究运行、每日任务）；路径和上传校验；`web/` 的 React 页面 | `test_web_api_reads_runs_and_guards_paths` |
 | 滚动训练 | `qlib_model.folds` / `walk_forward`：扩张或固定窗口，训练 / 验证 / 预测间隔 embargo，逐折和整体样本外评估 | `test_walk_forward_folds_have_embargo`、`test_walk_forward_runs_and_locks_test` |
