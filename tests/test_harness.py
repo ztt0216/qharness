@@ -679,3 +679,33 @@ def test_registry_exprs_keep_registered_direction():
     items = [{"name": "a", "code": "QLIB:-1*(Mean($volume,5))", "hypothesis": {"direction": -1}},
              {"name": "b", "code": "def factor(df):\n    return df['close']", "hypothesis": {}}]
     assert registry_exprs(items) == {"a": "-1*(Mean($volume,5))"}  # 登记代码已含方向，不再翻一次；Python 因子跳过
+
+
+def test_walk_forward_folds_have_embargo():
+    """滚动切分：训练 → 验证 → 预测依次排开，中间各隔 EMBARGO 天；预测段首尾相接、不重叠。"""
+    from qharness.data import EMBARGO
+    from qharness.qlib_model import folds
+
+    cal = pd.bdate_range("2023-01-02", periods=925)
+    fs = folds(cal, step=63, valid_days=120, min_train=250)
+    pos = lambda s: cal.get_loc(pd.Timestamp(s))  # noqa: E731
+    for f in fs:
+        assert pos(f["valid"][0]) - pos(f["train"][1]) == EMBARGO + 1
+        assert pos(f["test"][0]) - pos(f["valid"][1]) == EMBARGO + 1
+    for a, b in zip(fs, fs[1:]):
+        assert pos(b["test"][0]) == pos(a["test"][1]) + 1
+    assert fs[-1]["test"][1] == str(cal[-1].date())
+    rolling = folds(cal, step=63, valid_days=120, min_train=250, train_days=250)
+    assert all(pos(f["train"][1]) - pos(f["train"][0]) == 249 for f in rolling)
+
+
+def test_walk_forward_runs_and_locks_test(df, risk, qlib_env, tmp_path):
+    from qharness.qlib_model import walk_forward
+
+    kw = dict(model="hgb", topk=5, model_kw={"step": 10, "max_iter": 20, "patience": 1}, step=60, valid_days=40,
+              min_train=120)
+    s = walk_forward(Evaluator(df, risk=risk, test_log=str(tmp_path / "o.txt")), tmp_path / "wf", **kw)
+    assert s["n_folds"] >= 3 and len(s["folds"]) == s["n_folds"]
+    assert s["oos"]["model"]["n_days"] > 100 and "test" in s["by_segment"]
+    with pytest.raises(_Locked):
+        walk_forward(Evaluator(df, risk=risk, test_log=str(tmp_path / "o.txt")), tmp_path / "wf2", **kw)

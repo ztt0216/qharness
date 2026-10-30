@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from . import qlib_bridge as qb
-from .data import LABEL_HORIZON, segment_dates
+from .data import EMBARGO, LABEL_HORIZON, segment_dates
 from .evaluate import Evaluator
 
 LABEL = f"Ref($close, -{LABEL_HORIZON + 1})/Ref($close, -1) - 1"
@@ -108,6 +108,16 @@ def _handler_cls():
     return Alpha158Plus
 
 
+def _make_model(model: str, seed: int, model_kw: dict | None):
+    use = "lgb" if model == "lgb" or (model == "auto" and lightgbm_ok()) else "hgb"
+    if use == "lgb":
+        from qlib.contrib.model.gbdt import LGBModel
+
+        return use, LGBModel(loss="mse", learning_rate=0.05, num_leaves=63, min_data_in_leaf=200, lambda_l2=1.0,
+                             early_stopping_rounds=50, num_boost_round=1000, seed=seed, verbose=-1)
+    return use, HGBModel(seed=seed, **(model_kw or {}))
+
+
 def train(ev: Evaluator, out_dir: str | Path, model: str = "auto", extra: dict[str, str] | None = None,
           topk: int = 20, seed: int = 0, model_kw: dict | None = None) -> dict:
     """训练 → 预测测试段 → 用 Harness 的口径评估。返回摘要并写入 out_dir/summary.json。"""
@@ -129,14 +139,7 @@ def train(ev: Evaluator, out_dir: str | Path, model: str = "auto", extra: dict[s
                              end_time=str(dates.max().date()), fit_start_time=seg["train"][0],
                              fit_end_time=seg["train"][1], label=([LABEL], ["LABEL0"]))
     dataset = DatasetH(handler, segments=seg)
-    use = "lgb" if model == "lgb" or (model == "auto" and lightgbm_ok()) else "hgb"
-    if use == "lgb":
-        from qlib.contrib.model.gbdt import LGBModel
-
-        m = LGBModel(loss="mse", learning_rate=0.05, num_leaves=63, min_data_in_leaf=200, lambda_l2=1.0,
-                     early_stopping_rounds=50, num_boost_round=1000, seed=seed, verbose=-1)
-    else:
-        m = HGBModel(seed=seed, **(model_kw or {}))
+    use, m = _make_model(model, seed, model_kw)
 
     warnings.filterwarnings("ignore", message="Mean of empty slice")  # Qlib 的 IC 分析在全空截面上逐日刷屏
     with R.start(experiment_name="qharness_alpha158", uri=(out_dir / "mlruns").resolve().as_uri()):
@@ -182,6 +185,112 @@ def train(ev: Evaluator, out_dir: str | Path, model: str = "auto", extra: dict[s
         "baseline_test": {k: base_test.get(k) for k in ("rank_ic", "rank_icir", "rank_ic_t_nw", "long_short")},
         "valid_l2_history": getattr(m, "history", None),
         "backtest": bt, "backtest_qlib": bt_qlib,
+        "backtest_by_phase": {k: {"min": min(v), "median": float(np.median(v)), "max": max(v), "all": v}
+                              for k, v in phase.items()},
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str),
+                                          encoding="utf-8")
+    pred.dropna().to_frame("score").to_pickle(out_dir / "pred.pkl")
+    return summary
+
+
+# ------------------------------------------------------------------ 滚动训练
+
+def folds(cal: pd.DatetimeIndex, step: int = 63, valid_days: int = 120, min_train: int = 250,
+          train_days: int | None = None) -> list[dict[str, tuple[str, str]]]:
+    """滚动切分：每折预测接下来 step 天；验证段是预测段前的 valid_days 天，训练段是再往前的数据
+    （train_days=None 时从头扩张，否则只取最近 train_days 天）。训练 / 验证 / 预测之间各隔 EMBARGO 天，
+    标签（看 t+1~t+6 的价格）不会跨进下一段。"""
+    e, out = EMBARGO, []
+    p0 = min_train + e + valid_days + e
+    while p0 < len(cal):
+        p1 = min(p0 + step, len(cal))
+        v1 = p0 - e
+        v0 = v1 - valid_days
+        t1 = v0 - e
+        t0 = 0 if train_days is None else max(0, t1 - train_days)
+        d = lambda i: str(cal[i].date())  # noqa: E731
+        out.append({"train": (d(t0), d(t1 - 1)), "valid": (d(v0), d(v1 - 1)), "test": (d(p0), d(p1 - 1))})
+        p0 = p1
+    return out
+
+
+def walk_forward(ev: Evaluator, out_dir: str | Path, model: str = "auto", extra: dict[str, str] | None = None,
+                 topk: int = 20, seed: int = 0, model_kw: dict | None = None, step: int = 63,
+                 valid_days: int = 120, min_train: int = 250, train_days: int | None = None) -> dict:
+    """按季度向前滚：每折重新训练（验证段早停），只预测下一个季度；各折的样本外预测拼成一条，
+    逐折、逐段（验证段 / 测试段）和整体评估。拼起来的预测覆盖了测试段，所以照样经过测试段锁。"""
+    from qlib.data.dataset import DatasetH
+
+    from .strategy import backtest, combine
+
+    qb.init()
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cal = ev.df.index.get_level_values("datetime").unique().sort_values()
+    plan = folds(cal, step, valid_days, min_train, train_days)
+    if not plan:
+        raise ValueError(f"数据只有 {len(cal)} 天，不够切出一折（至少要 {min_train + 2 * EMBARGO + valid_days + 1} 天）")
+    insts = sorted(ev.df.index.get_level_values("instrument").unique())
+    handler = _handler_cls()(extra=extra, instruments=insts, start_time=str(cal[0].date()),
+                             end_time=str(cal[-1].date()), fit_start_time=plan[0]["train"][0],
+                             fit_end_time=plan[0]["train"][1], label=([LABEL], ["LABEL0"]))  # 特征只算一次，各折复用
+    warnings.filterwarnings("ignore", message="Mean of empty slice")
+    preds, meta = [], []
+    for f in plan:
+        use, m = _make_model(model, seed, model_kw)
+        m.fit(DatasetH(handler, segments=f))
+        p = m.predict(DatasetH(handler, segments=f), segment="test")
+        preds.append(p)
+        meta.append({**f, "best_iter": getattr(m, "best_iter", None)})
+    pred = pd.concat(preds)
+    pred.index = pred.index.set_names(["datetime", "instrument"])
+    pred = pred[~pred.index.duplicated()].reindex(ev.df.index)
+
+    key = "qlib_walk_forward:" + hashlib.sha1(json.dumps(
+        [use, seed, sorted(extra or {}), plan, model_kw or {}], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    test = ev.evaluate_test(pred, key)["test"]  # 登记测试段被打开（拼接预测覆盖了测试段）
+
+    base_score = combine(ev, list(ev.raw_library.values()))
+    model_score = pred.unstack("instrument").reindex(index=base_score.index, columns=base_score.columns)
+    fm, fb = ev._prep(pred), ev._prep(base_score.stack().rename("s"))
+    keys = ("rank_ic", "rank_ic_t_nw", "n_days")
+
+    def ric(fw, d):
+        r = ev._segment_metrics(fw, d) if len(d) >= 10 else {}
+        return {k: r.get(k) for k in keys}
+
+    rows = []
+    for f in meta:
+        d = cal[(cal >= f["test"][0]) & (cal <= f["test"][1])]
+        d = d[:-EMBARGO] if f is not meta[-1] else d  # 末尾 6 天的标签落在下一折，和下一折重叠
+        d = d[ev.label_w.loc[d].notna().sum(axis=1).to_numpy() > 0]  # 最后几天还没有标签
+        bm = backtest(ev.df, model_score, d, topk, risk=ev.risk) if len(d) > 10 else {}
+        bb = backtest(ev.df, base_score, d, topk, risk=ev.risk) if len(d) > 10 else {}
+        rows.append({"predict": f["test"], "train": f["train"], "best_iter": f["best_iter"],
+                     "model": ric(fm, d), "baseline": ric(fb, d),
+                     "excess_model": bm.get("annual_excess"), "excess_baseline": bb.get("annual_excess")})
+
+    oos = cal[(cal >= plan[0]["test"][0])]
+    oos = oos[ev.label_w.loc[oos].notna().sum(axis=1).to_numpy() > 0]
+    by_seg = {}
+    for name in ("train", "valid", "test"):
+        d = segment_dates(ev.df, getattr(ev.split, name)).intersection(oos)
+        if len(d) >= 10:
+            by_seg[name] = {"dates": (str(d[0].date()), str(d[-1].date())), "model": ric(fm, d), "baseline": ric(fb, d)}
+    phase = {k: [backtest(ev.df, sc, oos[i:], topk, risk=ev.risk)["annual_excess"] for i in range(5)]
+             for k, sc in (("baseline", base_score), ("model", model_score))}
+    pos = [r for r in rows if r["model"]["rank_ic"] is not None]
+    summary = {
+        "model": use, "n_features": len(handler.get_cols()) - 1, "extra_features": sorted(extra or {}),
+        "label": LABEL, "n_folds": len(plan), "step": step, "valid_days": valid_days, "min_train": min_train,
+        "train_window": train_days or "expanding",
+        "oos": {"dates": (str(oos[0].date()), str(oos[-1].date())), "model": ric(fm, oos), "baseline": ric(fb, oos)},
+        "by_segment": by_seg,  # 落在原切分的哪一段（训练段的部分对滚动模型来说也是样本外）
+        "test_segment": {k: test.get(k) for k in keys},
+        "folds_positive_rank_ic": f"{sum(r['model']['rank_ic'] > 0 for r in pos)}/{len(pos)}",
+        "folds_beat_baseline": f"{sum(r['model']['rank_ic'] > (r['baseline']['rank_ic'] or 0) for r in pos)}/{len(pos)}",
+        "folds": rows,
         "backtest_by_phase": {k: {"min": min(v), "median": float(np.median(v)), "max": max(v), "all": v}
                               for k, v in phase.items()},
     }

@@ -314,7 +314,7 @@ def cmd_qlib_dump(data: Path, out: Path) -> Path:
 def cmd_qlib_train(args) -> dict:
     """Alpha158 + 梯度提升树，按 Harness 的切分和测试段纪律评估，和 5 个基础因子的等权基线比较。"""
     from . import qlib_bridge as qb
-    from .qlib_model import registry_exprs, train
+    from .qlib_model import registry_exprs, train, walk_forward
 
     if not qb.available():
         raise SystemExit("没有 Qlib 数据目录：先运行 qharness qlib-dump")
@@ -322,6 +322,10 @@ def cmd_qlib_train(args) -> dict:
     out = Path(args.out) / time.strftime("%Y%m%d_%H%M%S")
     extra = registry_exprs(FactorRegistry(Path(args.registry)).items()) if args.with_registry else None
     ev = Evaluator(df, risk=risk, test_log=str(Path(args.out) / "test_opened.txt"))  # 同一配置的测试段只开一次
+    if args.walk_forward:
+        return _print_walk_forward(walk_forward(ev, out, model=args.model, extra=extra, topk=args.topk, seed=args.seed,
+                                                step=args.step, valid_days=args.valid_days,
+                                                min_train=args.min_train, train_days=args.train_days), out)
     s = train(ev, out, model=args.model, extra=extra, topk=args.topk, seed=args.seed)
     t, b = s["test"], s["baseline_test"]
     print(f"模型 {s['model']}，特征 {s['n_features']} 个，最优轮数 {s['best_iter']}；结果在 {out}")
@@ -331,6 +335,23 @@ def cmd_qlib_train(args) -> dict:
         ph = s["backtest_by_phase"][k]
         print(f"  {k:8s} 年化超额 自有回测 {s['backtest'][k]['annual_excess']:+.2%}（5 个调仓起点 "
               f"{ph['min']:+.1%} ~ {ph['max']:+.1%}）  Qlib 回测 {q.get('annual_excess', float('nan')):+.2%}")
+    return s
+
+
+def _print_walk_forward(s: dict, out: Path) -> dict:
+    f = lambda r: f"{r['rank_ic']:+.4f}（t {r['rank_ic_t_nw']:+.1f}）" if r.get("rank_ic") is not None else "—"  # noqa: E731
+    pct = lambda v: f"{v:+.1%}" if v is not None else "—"  # noqa: E731
+    print(f"滚动训练 {s['n_folds']} 折（每折预测 {s['step']} 天，训练窗口 {s['train_window']}），模型 {s['model']}；结果在 {out}")
+    print("预测区间                  最优轮数  模型 RankIC         基线 RankIC         模型超额  基线超额")
+    for r in s["folds"]:
+        print(f"{r['predict'][0]}~{r['predict'][1]}  {r['best_iter']!s:>6}  {f(r['model']):18s}  {f(r['baseline']):18s}  "
+              f"{pct(r['excess_model']):>7}  {pct(r['excess_baseline']):>7}")
+    o = s["oos"]
+    print(f"样本外整体 {o['dates'][0]}~{o['dates'][1]}：模型 {f(o['model'])}  基线 {f(o['baseline'])}")
+    print(f"RankIC 为正的折 {s['folds_positive_rank_ic']}，跑赢基线的折 {s['folds_beat_baseline']}")
+    for k in ("baseline", "model"):
+        ph = s["backtest_by_phase"][k]
+        print(f"  {k:8s} 样本外年化超额（5 个调仓起点）{ph['min']:+.1%} ~ {ph['max']:+.1%}，中位数 {ph['median']:+.1%}")
     return s
 
 
@@ -358,6 +379,11 @@ def main(argv=None):
     qt.add_argument("--topk", type=int, default=20)
     qt.add_argument("--seed", type=int, default=0)
     qt.add_argument("--out", default=str(ROOT / "runs" / "qlib_model"))
+    qt.add_argument("--walk-forward", action="store_true", help="滚动训练：每折重新训练，只预测下一段，样本外拼接评估")
+    qt.add_argument("--step", type=int, default=63, help="滚动训练每折预测的天数（默认 63，约一个季度）")
+    qt.add_argument("--valid-days", type=int, default=120, help="滚动训练每折的验证段天数（早停用）")
+    qt.add_argument("--min-train", type=int, default=250, help="第一折训练段至少多少天")
+    qt.add_argument("--train-days", type=int, help="训练窗口天数（不给则从头扩张）")
     for name in ("run", "demo"):
         s = sub.add_parser(name)
         s.add_argument("--report")

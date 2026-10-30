@@ -45,7 +45,7 @@ uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python -r requi
 | `demo` | 用 `samples/` 里的示例研报跑 `run` | 同上 |
 | `update` | 刷新最新沪深 300 成分；新成分股补全历史；已有股票追加最近交易日；有 Qlib 目录时一并重新生成 | `data/hs300/`、`data/qlib_cn/` |
 | `qlib-dump` | 行情缓存转成 Qlib 数据目录（之后 `run` / `daily` 自动启用 Qlib，`--no-qlib` 关闭） | `data/qlib_cn/` |
-| `qlib-train` | Qlib 模型训练：Alpha158 特征 + 梯度提升树，沿用 Harness 的切分和测试段纪律，和 5 个基础因子的等权基线比较（`--with-registry` 把 Qlib 表达式写的登记因子加进特征） | `runs/qlib_model/<时间>/`：`summary.json`、`pred.pkl`、`mlruns/` |
+| `qlib-train` | Qlib 模型训练：Alpha158 特征 + 梯度提升树，沿用 Harness 的切分和测试段纪律，和 5 个基础因子的等权基线比较（`--with-registry` 把 Qlib 表达式写的登记因子加进特征；`--walk-forward` 按季度滚动训练、样本外拼接评估） | `runs/qlib_model/<时间>/`：`summary.json`、`pred.pkl`、`mlruns/` |
 | `daily` | 因子库 + 登记因子等权合成，在最新成分里选 TopK，对比上次持仓给出买卖清单 | `portfolio/<日期>.csv` |
 | `daily --paper` | 同上，并更新模拟账户：上次挂单在之后第一个交易日开盘撮合、逐日记净值，到调仓周期挂新单 | `portfolio/account.json`、`account.trades.csv` |
 | `paper-sim` | 模拟账户历史回放（默认测试段），输出净值、成交记录，并和同区间回测对照 | `runs/paper_sim/` |
@@ -166,8 +166,32 @@ baostock 并发太高会封 IP，东财接口会断连接，所以下载都是�
   - 截断重算：测试段两个日期，只用到当天的数据重新算 158 个特征，和全量计算完全一致（最大差 0）。
   - 信号延迟：用 1 / 3 / 5 / 10 天前的预测交易，年化超额 +53% / +42% / +25% / +11%，逐步衰减，没有断崖。
   - 分月：9 个月里 6 个月为正，7 月 -7.9%。
-- 结论：排序能力在测试段统计上成立（t 3.5），但年化超额的点估计来自不到一年的样本，调仓起点不同就在 +14% ~ +40% 之间，不能当作可预期收益。
+- 结论：排序能力在测试段统计上成立（t 3.5），但年化超额的点估计来自不到一年的样本，调仓起点不同就在 +14% ~ +40% 之间，不能当作可预期收益。下面的滚动训练说明，这个测试段恰好落在模型有效的时期。
 - 测试段纪律的说明：开发时同一配置在临时目录里跑过两次（第一次跑通、第二次加相位统计），中间没有改模型和特征；正式记录是 `runs/qlib_model/` 下的这次。
+
+#### 滚动训练（`qlib-train --walk-forward`）
+
+单次切分只有一个不到一年的测试段。滚动训练每个季度向前滚一次：用之前的全部数据重新训练（扩张窗口，`--train-days` 可改成固定窗口），预测段前的 120 天做验证段早停，只预测接下来的 63 天。训练、验证、预测之间各隔 6 天。各折的样本外预测拼成一条，覆盖 2024-08 ~ 2026-10，共 9 折，约 1 分钟。Alpha158 特征只算一次，各折复用。拼接的预测覆盖了测试段，同样经过测试段锁。
+
+| 预测区间 | 模型 RankIC（t） | 基线 RankIC（t） | 模型超额 | 基线超额 |
+|---|---|---|---|---|
+| 2024-08 ~ 2024-11 | -0.002（-0.1） | -0.010（-0.5） | +7.2% | -32.1% |
+| 2024-11 ~ 2025-02 | +0.024（+1.0） | +0.048（+1.4） | +18.0% | +9.6% |
+| 2025-02 ~ 2025-05 | +0.040（+1.7） | -0.008（-0.3） | +2.7% | -0.6% |
+| 2025-05 ~ 2025-08 | -0.013（-0.8） | -0.021（-1.2） | -5.0% | -24.3% |
+| 2025-08 ~ 2025-11 | +0.030（+1.5） | +0.020（+0.8） | -2.9% | -18.5% |
+| 2025-11 ~ 2026-02 | -0.018（-1.1） | -0.003（-0.2） | -42.0% | -23.0% |
+| 2026-02 ~ 2026-06 | +0.032（+2.2） | -0.004（-0.1） | +40.6% | -8.8% |
+| 2026-06 ~ 2026-08 | +0.023（+1.2） | -0.002（-0.1） | -28.9% | -20.8% |
+| 2026-08 ~ 2026-10 | +0.038（+1.2） | +0.103（+2.2） | -19.4% | +38.2% |
+| **样本外整体** | **+0.017（+2.4）** | **+0.012（+1.2）** | **-6.7% ~ +3.1%，中位数 -2.7%** | **-15.5% ~ -7.2%，中位数 -10.8%** |
+
+（RankIC 都是中性化后的；超额是单个季度年化后的数，波动很大；整体超额是 5 个调仓起点的区间。）
+
+- 9 折里 6 折 RankIC 为正、6 折跑赢基线；样本外整体 RankIC 0.017，t 2.4，比基线强，但只有单次切分测试段（0.042）的四成。
+- 按原切分拆开：落在原验证段（2025-04 ~ 2026-01）的部分 RankIC 0.001，基本无效；落在原测试段的部分 0.034（t 3.1），和单次切分一致。模型的有效性随市场状态变化，单次切分的测试段正好是有效的那段。
+- 扣掉费用后，样本外年化超额中位数 -2.7%：排序能力有，但不足以覆盖 5 天一调仓的换手成本。基线更差（-10.8%）。
+- 每一折的最优轮数都是第一次检查时的 20 棵树：验证段 L2 从一开始就上升，说明训练段学到的关系到验证段就衰减了。还没有用更细的早停步长或更强的正则去调，调了要再开一次测试段，会留下记录。
 
 ### 因子方向由 Harness 施加
 
@@ -264,6 +288,7 @@ baostock 并发太高会封 IP，东财接口会断连接，所以下载都是�
 | 方向由 Harness 施加 | `sandbox.with_direction`；实验层提示词不含 direction；只翻方向时跳过重新生成 | `test_direction_applied_by_harness`、`test_coder_does_not_see_direction` |
 | Qlib | `qlib_bridge.py`：数据转换、表达式白名单、和行情一致性检查、TopkDropout 回测复核 | `test_qlib_expression_matches_pandas`、`test_qlib_expression_static_rules`、`test_qlib_rejects_stale_data`、`test_qlib_backtest_runs`、`test_experiment_agent_uses_qlib_tool_real_model` |
 | Qlib 模型训练 | `qlib_model.py`：Alpha158 + 梯度提升树（LightGBM 不可用时 sklearn），Qlib workflow 记录，Harness 口径评估，测试段按配置加锁，调仓相位区间 | `test_qlib_model_train_alpha158`、`test_registry_exprs_keep_registered_direction` |
+| 滚动训练 | `qlib_model.folds` / `walk_forward`：扩张或固定窗口，训练 / 验证 / 预测间隔 embargo，逐折和整体样本外评估 | `test_walk_forward_folds_have_embargo`、`test_walk_forward_runs_and_locks_test` |
 | 候选并行 | `FactorHarness.run(workers=N)`：线程池；共享状态加锁；trace 带候选标签 | `test_duplicate_check_is_atomic_across_threads`、`test_tracer_tags_events_per_thread`、`test_parallel_candidates_real_model` |
 | 去重 | `orchestrator.factor_key`（同一因子才跳过已淘汰方向）、`_duplicate_of`（按因子值） | `test_factor_key_same_factor_only`、`test_duplicate_by_values` |
 
@@ -334,5 +359,5 @@ QH_ENV_FILE=path/to/.env .venv/bin/python -m pytest -q
 - PDF 解析针对「图表 N：标题 … 来源：」这种文字排版的券商研报；扫描件、图片里的表格、公式的上下标结构（只保留了拆行后的顺序）都没有处理。
 - 东方财富上公开的个股量价金工研报很少；日频可验证的研报需要自己提供 PDF。
 - `--llm openai` 路径尚未实测。
-- Qlib 接了数据、表达式计算、回测复核和模型训练（Alpha158 + 梯度提升树，用 Python 搭的 workflow，没有用 `qrun` 的 YAML 配置）；评估（中性化 RankIC、Newey-West、分段检验）仍是自己的实现。这台机器上 LightGBM 因缺 libomp 加载不了，实测用的是 sklearn 的同类模型。模型只在一个不到一年的测试段上验证过，没做滚动训练。自带 `--csv` 行情时不启用 Qlib。
+- Qlib 接了数据、表达式计算、回测复核和模型训练（Alpha158 + 梯度提升树，用 Python 搭的 workflow，没有用 `qrun` 的 YAML 配置）；评估（中性化 RankIC、Newey-West、分段检验）仍是自己的实现。这台机器上 LightGBM 因缺 libomp 加载不了，实测用的是 sklearn 的同类模型。滚动训练的样本外只有 2.2 年、9 个季度，扣费后超额为负。自带 `--csv` 行情时不启用 Qlib。
 - 续跑时，中断那一刻正在执行的节点会重做一次（比如正在等模型返回的「生成代码」）；节点里写经验库的操作因此可能重复一次，经验库会把近似重复的记录合并。
