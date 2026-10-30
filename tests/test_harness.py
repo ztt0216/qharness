@@ -745,3 +745,85 @@ def test_web_api_reads_runs_and_guards_paths(tmp_path):
     assert ok["value"].startswith("uploads/") and (tmp_path / "runs" / ok["value"]).exists()
     assert c.post("/api/jobs/run", json={"report": "../qharness/cli.py"}).status_code == 400
     assert c.get("/api/paper").json()["account"] is None
+
+
+def test_report_fetch_title_filter():
+    from qharness.report_fetch import title_ok
+
+    assert title_ok("Alpha 掘金系列之五：基于日频量价的筹码因子")[0]
+    assert title_ok("北交所选股：小市值第一性原理×五因子模型")[0]
+    assert not title_ok("宏观量化经济指数周报：出口保持韧性")[0]       # 周报、宏观
+    assert not title_ok("基于 LSTM 的量化择时与动态仓位管理")[0]          # 择时
+    assert not title_ok("月度市场策略：为有源头活水来")[0]                # 没有因子相关词
+
+
+def test_report_fetch_pipeline_offline(tmp_path, monkeypatch):
+    """列表 → 标题筛选 → 下载 → 程序预筛（日内数据）→ 模型预筛（程序复核）；全部离线，网络和 PDF 解析用假的。"""
+    import io
+    import json as _json
+    from qharness import report_fetch as rf
+    from qharness import report_pdf
+
+    rows = [{"infoCode": "A1", "title": "量价因子研究：日频换手率的反转效应", "orgSName": "某证券", "publishDate": "2026-10-01 00:00:00", "attachPages": 20},
+            {"infoCode": "A2", "title": "逐笔成交视角下的选股因子", "orgSName": "某证券", "publishDate": "2026-10-02 00:00:00", "attachPages": 18},
+            {"infoCode": "A3", "title": "多因子选股：分析师预期因子", "orgSName": "某证券", "publishDate": "2026-10-03 00:00:00", "attachPages": 15},
+            {"infoCode": "B1", "title": "宏观量化经济指数周报", "orgSName": "某证券", "publishDate": "2026-10-04 00:00:00", "attachPages": 9}]
+    pages = {1: {"data": rows[:2], "TotalPage": 2}, 2: {"data": rows[2:], "TotalPage": 2}}
+    import re
+    fetch = lambda url: pages[int(re.search(r"pageNo=(\d+)", url).group(1))]  # noqa: E731
+    idx = rf.ReportIndex(tmp_path)
+    c = rf.collect(idx, days=30, end="2026-10-30", fetch=fetch)
+    assert c == {"seen": 4, "new": 3, "begin": "2026-09-30", "end": "2026-10-30"}
+    assert set(idx.items) == {"A1", "A2", "A3"} and idx.items["A1"]["status"] == "listed"
+    assert rf.collect(idx, days=30, end="2026-10-30", fetch=fetch)["new"] == 0  # 已在索引里的不重复
+
+    class Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    for code in ("A1", "A2", "A3"):
+        rf.download(idx, code, opener=lambda req, timeout: Resp(b"%PDF-1.4 fake"))
+    assert idx.items["A1"]["status"] == "downloaded" and (tmp_path / "A1.pdf").exists()
+    with pytest.raises(ValueError):
+        idx.update("X", url="u", title="t")
+        rf.download(idx, "X", opener=lambda req, timeout: Resp(b"<html>"))  # 不是 PDF
+
+    texts = {"A1": "本文用日频换手率构建反转因子。", "A2": "逐笔 委托 主动买 分钟 " * 5, "A3": "分析师一致预期上调因子。"}
+    monkeypatch.setattr(report_pdf, "pdf_to_text", lambda p: texts[Path(p).stem])
+
+    class LLM:
+        def __init__(self): self.n = 0
+        def chat(self, role, msgs, ctx):
+            self.n += 1
+            if "日频换手率构建" in msgs[-1]["content"]:
+                return _json.dumps({"type": "截面选股因子", "factors": [{"name": "换手反转", "data": "日频行情"}], "reason": "日线可算"})
+            return _json.dumps({"type": "截面选股因子", "factors": [{"name": "预期上调", "data": "分析师预期"}], "reason": "要预期数据"})
+    llm = LLM()
+    assert rf.screen(idx, "A1", llm)["status"] == "queued"
+    a2 = rf.screen(idx, "A2", llm)
+    assert a2["status"] == "screened_out" and a2["stage"] == "program"   # 日内标记太多，不调用模型
+    a3 = rf.screen(idx, "A3", llm)
+    assert a3["status"] == "screened_out" and "分析师预期" in a3["reason"]
+    assert llm.n == 2
+    assert [x["code"] for x in rf.ReportIndex(tmp_path).by_status("queued")] == ["A1"]  # 落盘，重开还在
+
+
+def test_web_api_reports_joins_runs(tmp_path):
+    """研报来源页：读索引；从页面发起的研究按研报文件名对上运行记录。"""
+    import json as _json
+    from fastapi.testclient import TestClient
+    from qharness.web import create_app
+
+    auto = tmp_path / "data" / "reports" / "auto"
+    auto.mkdir(parents=True)
+    (auto / "A1.pdf").write_bytes(b"%PDF")
+    (auto / "index.json").write_text(_json.dumps({
+        "A1": {"code": "A1", "title": "量价因子", "date": "2026-10-01", "status": "queued", "path": "A1.pdf"},
+        "A2": {"code": "A2", "title": "逐笔因子", "date": "2026-10-02", "status": "screened_out"}}), encoding="utf-8")
+    d = tmp_path / "runs" / "20261031-000000-abcdef"
+    d.mkdir(parents=True)
+    (d / "args.json").write_text(_json.dumps({"report": str(auto / "A1.pdf")}), encoding="utf-8")
+    c = TestClient(create_app(tmp_path))
+    r = c.get("/api/reports").json()
+    assert [x["code"] for x in r["items"]] == ["A2", "A1"] and r["counts"] == {"queued": 1, "screened_out": 1}
+    assert r["items"][1]["runs"][0]["id"] == "20261031-000000-abcdef" and r["items"][0]["runs"] == []
+    assert c.post("/api/jobs/run", json={"report": "auto/../../x.pdf"}).status_code == 400

@@ -42,6 +42,7 @@ class Paths:
         self.data = root / "data" / "hs300"
         self.models = self.runs / "qlib_model"
         self.web = root / "web" / "dist"
+        self.auto = root / "data" / "reports" / "auto"  # 自动搜集的研报（report_fetch.py）
 
 
 def _json(p: Path, default=None):
@@ -194,6 +195,11 @@ def _last_prices(data: Path, insts: list[str]) -> dict[str, dict]:
 
 # ------------------------------------------------------------------ 应用
 
+class FetchReports(BaseModel):
+    days: int = 30
+    download: int = 10
+
+
 class StartRun(BaseModel):
     report: str  # samples/ 下的文件名，或上传后返回的 uploads/ 路径
     workers: int = 1
@@ -317,6 +323,8 @@ def create_app(root: Path = ROOT) -> FastAPI:
     def _report_path(value: str) -> Path:
         if value.startswith("uploads/"):
             p = P.uploads / Path(value).name
+        elif value.startswith("auto/"):
+            p = P.auto / Path(value).name
         else:
             p = P.samples / Path(value).name
         if not p.exists() or p.suffix.lower() not in REPORT_EXT:
@@ -333,6 +341,29 @@ def create_app(root: Path = ROOT) -> FastAPI:
         if req.no_strategy:
             cmd.append("--no-strategy")
         return jobs.start("research", [cmd], {"run_id": rid})
+
+    @app.get("/api/reports")
+    def reports():
+        idx = _json(P.auto / "index.json", {}) or {}
+        runs_by_report: dict[str, list[dict]] = {}  # 从页面发起的研究不经过索引：按研报文件名对上运行记录
+        r = running_runs()
+        for d in sorted((x for x in P.runs.glob("*") if x.is_dir() and RUN_ID.match(x.name)), reverse=True):
+            rep = (_json(d / "args.json", {}) or {}).get("report")
+            if rep and Path(rep).parent.name == "auto":
+                runs_by_report.setdefault(Path(rep).name, []).append(run_summary(d, r))
+        items = []
+        for x in sorted(idx.values(), key=lambda x: (x.get("date", ""), x.get("code", "")), reverse=True):
+            items.append({**{k: v for k, v in x.items() if k != "screen"}, "screen": x.get("screen"),
+                          "runs": runs_by_report.get(x.get("path") or "", [])})
+        counts: dict[str, int] = {}
+        for x in items:
+            counts[x.get("status")] = counts.get(x.get("status"), 0) + 1
+        return {"items": items, "counts": counts}
+
+    @app.post("/api/jobs/reports")
+    def start_fetch(req: FetchReports):
+        return jobs.start("reports", [["reports", "fetch", "--days", str(max(1, min(365, req.days))),
+                                       "--download", str(max(1, min(50, req.download)))]])
 
     @app.post("/api/jobs/daily")
     def start_daily():

@@ -338,6 +338,32 @@ def cmd_qlib_train(args) -> dict:
     return s
 
 
+def cmd_reports(args):
+    from .report_fetch import ReportIndex, research, run_pipeline
+
+    if args.env_file:
+        load_env_file(args.env_file)
+    index = ReportIndex()
+    if args.action == "fetch":
+        llm = None if args.no_screen else make_llm(args.llm)
+        return run_pipeline(args.days, args.download, args.research, llm, index)
+    if args.action == "list":
+        for x in sorted(index.items.values(), key=lambda x: x.get("date", ""), reverse=True):
+            print(f"{x.get('date')}  [{x.get('status')}]  {x.get('org')}《{x.get('title')}》  {x.get('reason', '')}")
+        return index.items
+    codes = [args.code] if args.code else [x["code"] for x in index.by_status("queued")[:args.top]]
+    if not codes:
+        print("没有通过预筛、等待研究的研报。先运行 qharness reports fetch")
+    out = []
+    for c in codes:
+        if c not in index.items or not index.items[c].get("path"):
+            raise SystemExit(f"索引里没有下载好的研报 {c}")
+        r = research(index, c)
+        print(f"《{r['title']}》：{r['reason']}（运行 {r['run_id']}）")
+        out.append(r)
+    return out
+
+
 def _print_walk_forward(s: dict, out: Path) -> dict:
     f = lambda r: f"{r['rank_ic']:+.4f}（t {r['rank_ic_t_nw']:+.1f}）" if r.get("rank_ic") is not None else "—"  # noqa: E731
     pct = lambda v: f"{v:+.1%}" if v is not None else "—"  # noqa: E731
@@ -370,6 +396,17 @@ def main(argv=None):
     qd = sub.add_parser("qlib-dump", help="把行情缓存转成 Qlib 数据目录（update 之后会自动重做）")
     qd.add_argument("--data", default=str(DEFAULT_CACHE))
     qd.add_argument("--out", default=str(DEFAULT_QLIB))
+    rp = sub.add_parser("reports", help="自动找研报：东方财富策略类研报 → 标题筛选 → 下载 → 预筛 → 研究")
+    rp.add_argument("action", choices=["fetch", "list", "run"],
+                    help="fetch：搜集、下载并预筛；list：查看索引；run：研究已通过预筛的研报")
+    rp.add_argument("--days", type=int, default=30, help="fetch：往前找多少天")
+    rp.add_argument("--download", type=int, default=10, help="fetch：最多下载多少篇")
+    rp.add_argument("--research", type=int, default=0, help="fetch：预筛之后接着研究多少篇（默认 0，只筛不跑）")
+    rp.add_argument("--top", type=int, default=1, help="run：研究最新的几篇")
+    rp.add_argument("--code", help="run：指定研报编号")
+    rp.add_argument("--no-screen", action="store_true", help="fetch：不调用模型预筛")
+    rp.add_argument("--llm", choices=["anthropic", "openai"], default="anthropic")
+    rp.add_argument("--env-file")
     sv = sub.add_parser("serve", help="本地前端：运行记录、审计轨迹、因子库、模型、模拟账户；可发起研究运行")
     sv.add_argument("--host", default="127.0.0.1")
     sv.add_argument("--port", type=int, default=8765)
@@ -440,6 +477,8 @@ def main(argv=None):
 
     if args.cmd == "qlib-dump":
         return cmd_qlib_dump(Path(args.data), Path(args.out))
+    if args.cmd == "reports":
+        return cmd_reports(args)
     if args.cmd == "serve":
         from .web import serve
         return serve(args.host, args.port)

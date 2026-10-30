@@ -6,9 +6,11 @@ import NewRun from "./pages/NewRun";
 import Factors from "./pages/Factors";
 import Models from "./pages/Models";
 import Paper from "./pages/Paper";
+import Reports from "./pages/Reports";
 
 const NAV = [
   { to: "/", label: "总览", end: true },
+  { to: "/reports", label: "研报来源" },
   { to: "/runs", label: "研究运行" },
   { to: "/factors", label: "因子库" },
   { to: "/models", label: "模型" },
@@ -30,6 +32,7 @@ export default function App() {
       <main>
         <Routes>
           <Route path="/" element={<Overview />} />
+          <Route path="/reports" element={<Reports />} />
           <Route path="/runs" element={<Runs />} />
           <Route path="/runs/:id" element={<RunDetail />} />
           <Route path="/new" element={<NewRun />} />
