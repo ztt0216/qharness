@@ -827,3 +827,37 @@ def test_web_api_reports_joins_runs(tmp_path):
     assert [x["code"] for x in r["items"]] == ["A2", "A1"] and r["counts"] == {"queued": 1, "screened_out": 1}
     assert r["items"][1]["runs"][0]["id"] == "20261031-000000-abcdef" and r["items"][0]["runs"] == []
     assert c.post("/api/jobs/run", json={"report": "auto/../../x.pdf"}).status_code == 400
+
+
+def test_report_inbox_scan_dedup_and_screen(tmp_path):
+    """收件夹：新文件进索引并预筛；同内容改名不重复；刚写入的先等；其他格式忽略；原文件不动。"""
+    import json as _json
+    import os
+    import time as _time
+    from qharness import report_fetch as rf
+
+    inbox, idx = tmp_path / "inbox", rf.ReportIndex(tmp_path / "auto")
+    inbox.mkdir()
+    old = _time.time() - 60
+    (inbox / "量价研报.md").write_text("<!-- page: 1 -->\n## 核心观点\n日频换手率构建的反转因子。", encoding="utf-8")
+    (inbox / "同一篇改了名.md").write_text("<!-- page: 1 -->\n## 核心观点\n日频换手率构建的反转因子。", encoding="utf-8")
+    (inbox / "说明.docx").write_bytes(b"PK")
+    (inbox / ".DS_Store").write_bytes(b"x")
+    for f in inbox.iterdir():
+        os.utime(f, (old, old))
+    (inbox / "还在下载.pdf").write_bytes(b"%PDF")  # 刚写入：这次跳过
+
+    class LLM:
+        def chat(self, role, msgs, ctx):
+            return _json.dumps({"type": "截面选股因子", "factors": [{"name": "换手反转", "data": "日频行情"}], "reason": "日线可算"})
+
+    r = rf.run_inbox(LLM(), 0, idx, inbox, log=lambda m: None)
+    assert len(r["scan"]["added"]) == 1 and r["scan"]["skipped"] == 1 and r["scan"]["waiting"] == 1
+    code = r["scan"]["added"][0]
+    rec = idx.items[code]
+    assert code.startswith("LOCAL-") and rec["source"] == "inbox" and rec["status"] == "queued"
+    assert (tmp_path / "auto" / rec["path"]).exists() and (tmp_path / "auto" / f"{code}.text.md").exists()
+    assert sorted(f.name for f in inbox.iterdir()) == sorted([".DS_Store", "同一篇改了名.md", "说明.docx", "还在下载.pdf", "量价研报.md"])
+    os.utime(inbox / "还在下载.pdf", (old, old))
+    r2 = rf.scan_inbox(idx, inbox)  # 再扫：之前的不重复，刚才没写完的这次进来
+    assert len(r2["added"]) == 1 and r2["skipped"] == 2

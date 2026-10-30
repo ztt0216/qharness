@@ -120,7 +120,11 @@ def download(index: ReportIndex, code: str, max_mb: float = 30, opener=urllib.re
         if not data.startswith(b"%PDF"):
             raise ValueError("下载到的不是 PDF")
         dest.write_bytes(data)
-    index.update(code, status="downloaded", path=dest.name, size=dest.stat().st_size)
+    import hashlib
+
+    # 记内容指纹：同一篇研报再从收件夹放进来，按内容认出来，不重复研究
+    index.update(code, status="downloaded", path=dest.name, size=dest.stat().st_size, source="eastmoney",
+                 sha1=hashlib.sha1(dest.read_bytes()).hexdigest())
     return dest
 
 
@@ -145,6 +149,80 @@ SCREEN_PROMPT = """下面是一篇券商研报的标题和前几页。判断它�
 """
 
 
+def report_text(path: Path) -> str:
+    """和 run 命令同样的转换：PDF / PPT 转成带页码的文本，Markdown / 纯文本直接读。"""
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        from . import report_pdf
+        return report_pdf.pdf_to_text(path)
+    if suffix == ".pptx":
+        from .report_ppt import pptx_to_text
+        return pptx_to_text(path)
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+# ------------------------------------------------------------------ 收件夹
+
+INBOX = ROOT / "data" / "reports" / "inbox"
+INBOX_EXT = {".pdf", ".pptx", ".md", ".txt"}
+
+
+def scan_inbox(index: ReportIndex, inbox: Path = INBOX, min_age_s: float = 5) -> dict:
+    """收件夹里新出现的研报 → 复制进索引目录，状态记为待预筛。
+    按内容（sha1）去重：同一份研报改名或重复放入不会再处理；原文件不移动、不删除。
+    刚修改过的文件（min_age_s 秒内）先跳过，避免读到还没下载或复制完的文件。"""
+    import hashlib
+    import shutil
+
+    inbox = Path(inbox)
+    inbox.mkdir(parents=True, exist_ok=True)
+    known = {x.get("sha1") for x in index.items.values() if x.get("sha1")}
+    added, skipped, waiting = [], 0, 0
+    for f in sorted(inbox.iterdir()):
+        if not f.is_file() or f.name.startswith(".") or f.suffix.lower() not in INBOX_EXT:
+            continue
+        if time.time() - f.stat().st_mtime < min_age_s:
+            waiting += 1
+            continue
+        h = hashlib.sha1(f.read_bytes()).hexdigest()
+        if h in known:
+            skipped += 1
+            continue
+        code = f"LOCAL-{h[:12]}"
+        dest = index.root / f"{code}{f.suffix.lower()}"
+        shutil.copy2(f, dest)
+        index.update(code, title=f.stem, org="本地收件夹", source="inbox", file=f.name, sha1=h,
+                     date=time.strftime("%Y-%m-%d", time.localtime(f.stat().st_mtime)), pages=None,
+                     path=dest.name, size=dest.stat().st_size, status="downloaded", reason="收件夹新文件，待预筛")
+        known.add(h)
+        added.append(code)
+    return {"added": added, "skipped": skipped, "waiting": waiting, "inbox": str(inbox)}
+
+
+def run_inbox(llm=None, research_max: int = 0, index: ReportIndex | None = None, inbox: Path = INBOX,
+              log=print) -> dict:
+    """扫描收件夹 → 预筛新文件 →（可选）研究通过预筛的。"""
+    index = index or ReportIndex()
+    s = scan_inbox(index, inbox)
+    log(f"收件夹 {s['inbox']}：新文件 {len(s['added'])} 个，已处理过 {s['skipped']} 个"
+        + (f"，{s['waiting']} 个刚写入、下次再处理" if s["waiting"] else ""))
+    if llm is not None:
+        for code in s["added"]:
+            try:
+                r = screen(index, code, llm)
+            except Exception as e:  # noqa: BLE001  解析失败（加密 PDF、扫描件等）只影响这一篇
+                index.update(code, status="screened_out", stage="parse", reason=f"解析失败：{type(e).__name__}: {e}")
+                r = index.items[code]
+            log(f"  {'送进研究' if r['status'] == 'queued' else '筛掉'}《{r['title']}》：{r['reason']}")
+    ran = []
+    for rec in [x for x in index.by_status("queued") if x.get("source") == "inbox"][:research_max]:
+        log(f"  研究《{rec['title']}》…")
+        r = research(index, rec["code"])
+        ran.append(r["run_id"])
+        log(f"    {r['reason']}（运行 {r['run_id']}）")
+    return {"scan": s, "ran": ran}
+
+
 SIZE = re.compile(r"市值|规模|size", re.I)
 
 
@@ -166,11 +244,10 @@ def decide(out: dict) -> tuple[bool, str]:
 def screen(index: ReportIndex, code: str, llm, max_chars: int = 5000) -> dict:
     """程序先查日内数据标记，再用一次模型调用判断；最终是否送进研究流程由程序按模型的输出复核。"""
     from .llm import extract_json
-    from .report_pdf import pdf_to_text
 
     rec = index.items[code]
-    text = pdf_to_text(index.root / rec["path"])
-    (index.root / f"{code}.md").write_text(text, encoding="utf-8")
+    text = report_text(index.root / rec["path"])
+    (index.root / f"{code}.text.md").write_text(text, encoding="utf-8")  # 解析结果留档（不和 Markdown 原文重名）
     hits = [m.group(0) for m in INTRADAY.finditer(text)]
     if len(hits) > INTRADAY_HITS_MAX:
         words = sorted(set(hits))[:5]

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { LineChart } from "../charts";
 import { post, useApi, type Job } from "../api";
 import { money, pct, share, signedMoney, tone } from "../format";
@@ -12,6 +12,9 @@ export default function Paper() {
   const job = useApi<Job>(jobId ? `/api/jobs/${jobId}` : null, (d) => (!d || d.status === "running" ? 2000 : undefined));
   const running = job.data?.status === "running";
   const paper = useApi<any>("/api/paper", running ? 4000 : undefined);
+  const jobStatus = job.data?.status;
+  const reloadPaper = paper.reload;
+  useEffect(() => { if (jobStatus && jobStatus !== "running") reloadPaper(); }, [jobStatus, reloadPaper]);  // 任务结束后再取一次，轮询停之前的最后一次可能早于任务完成
 
   const settle = async () => {
     setErr(undefined);

@@ -43,6 +43,7 @@ class Paths:
         self.models = self.runs / "qlib_model"
         self.web = root / "web" / "dist"
         self.auto = root / "data" / "reports" / "auto"  # 自动搜集的研报（report_fetch.py）
+        self.inbox = root / "data" / "reports" / "inbox"  # 收件夹：自己下载的研报放这里
 
 
 def _json(p: Path, default=None):
@@ -358,12 +359,19 @@ def create_app(root: Path = ROOT) -> FastAPI:
         counts: dict[str, int] = {}
         for x in items:
             counts[x.get("status")] = counts.get(x.get("status"), 0) + 1
-        return {"items": items, "counts": counts}
+        pending = [f.name for f in sorted(P.inbox.glob("*")) if f.is_file() and f.suffix.lower() in REPORT_EXT
+                   and not f.name.startswith(".")] if P.inbox.exists() else []
+        return {"items": items, "counts": counts, "inbox": str(P.inbox), "inbox_files": len(pending)}
 
     @app.post("/api/jobs/reports")
     def start_fetch(req: FetchReports):
         return jobs.start("reports", [["reports", "fetch", "--days", str(max(1, min(365, req.days))),
                                        "--download", str(max(1, min(50, req.download)))]])
+
+    @app.post("/api/jobs/scan")
+    def start_scan():
+        P.inbox.mkdir(parents=True, exist_ok=True)
+        return jobs.start("reports", [["reports", "scan", "--inbox", str(P.inbox)]])
 
     @app.post("/api/jobs/daily")
     def start_daily():

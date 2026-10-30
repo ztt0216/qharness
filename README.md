@@ -59,6 +59,7 @@ QH_ENV_FILE=path/to/.env .venv/bin/python -m qharness serve
 | `daily --paper` | 同上，并更新模拟账户：上次挂单在之后第一个交易日开盘撮合、逐日记净值，到调仓周期挂新单 | `portfolio/account.json`、`account.trades.csv` |
 | `paper-sim` | 模拟账户历史回放（默认测试段），输出净值、成交记录，并和同区间回测对照 | `runs/paper_sim/` |
 | `reports fetch` / `list` / `run` | 自动找研报：东方财富策略类研报列表 → 标题筛选 → 下载 PDF → 程序和模型预筛 → 研究（`fetch --research N` 预筛完接着研究 N 篇） | `data/reports/auto/`：`index.json`、PDF |
+| `reports scan` / `watch` | 收件夹：自己下载的研报放进 `data/reports/inbox/`，扫描一次或持续监视（`--interval` 秒），新文件预筛后排队（`--research N` 接着研究） | 同上 |
 | `serve` | 本地前端：研究运行的审计轨迹（出处跳回研报原文）、因子库、模型逐折结果、模拟账户；可上传研报发起研究、更新行情并结算 | — |
 | `factors` | 查看登记因子（代码、各段指标、来源 run） | — |
 | `eval-research` | 研究层评测集打分 | `runs/research_eval.json` |
@@ -227,6 +228,17 @@ baostock 并发太高会封 IP，东财接口会断连接，所以下载都是�
 - **完整研究**：`reports run` 跑《风格制胜 3》，132 次调用、约 8.1 万 token，6 分钟。结论和之前人工跑的一致：20 日反转与因子库的 20 日动量相关 −1，本身不显著，淘汰；另外两个变体判为同一个因子，跳过。
 - **结论**：「自动找研报 → 预筛 → 研究」这条链路通了，预筛把 3 篇里的 2 篇挡在了 8 万 token 的完整研究之前。但只靠东方财富，每年只能找到一两篇值得研究的研报，要靠更多来源。
 
+#### 收件夹（`reports scan` / `watch`）
+
+需要登录的来源（慧博、萝卜投研、券商官网）由你自己下载，放进 `data/reports/inbox/`（`--inbox` 可改）：
+
+- 扫描时把新文件复制进索引目录，记为待预筛，然后走同样的程序预筛和模型预筛。PDF、PPT、Markdown、纯文本都行。
+- 按文件内容（sha1）去重：同一份研报改名或重复放入只处理一次；东方财富下载的研报也记了指纹，同一篇从收件夹再放进来会被认出来。
+- 原文件不移动、不删除；刚写入 5 秒内的文件先跳过，避免读到还没下载完的文件；解析失败（加密 PDF、扫描件）只影响那一篇。
+- `reports watch` 每 60 秒扫一次；前端「研报来源」页有「扫描收件夹」按钮，列表里标出每篇来自东方财富还是收件夹。
+
+实测：收件夹里放国金《Alpha 掘金之四》PDF、中银《风格制胜 3》PDF、示例研报的 PPT 和 Markdown。国金那篇全文 136 处逐笔数据标记，由程序筛掉，没有调用模型；中银那篇按内容认出是已从东方财富下载过的同一篇，跳过；两份示例研报各一次模型调用，判为可研究。
+
 ### 前端（`qharness serve`）
 
 FastAPI（`qharness/web.py`）+ React（`web/`，Vite + TypeScript）。后端只读项目里的运行记录和账户文件，另外能发起两类后台任务：研究运行（`run --report ... --run-id ...`）和每日任务（`update` 后 `daily --paper`）。只监听 127.0.0.1，运行编号和研报路径都校验过，上传只收 PDF / PPT / Markdown / 纯文本。
@@ -333,7 +345,7 @@ FastAPI（`qharness/web.py`）+ React（`web/`，Vite + TypeScript）。后端�
 | 方向由 Harness 施加 | `sandbox.with_direction`；实验层提示词不含 direction；只翻方向时跳过重新生成 | `test_direction_applied_by_harness`、`test_coder_does_not_see_direction` |
 | Qlib | `qlib_bridge.py`：数据转换、表达式白名单、和行情一致性检查、TopkDropout 回测复核 | `test_qlib_expression_matches_pandas`、`test_qlib_expression_static_rules`、`test_qlib_rejects_stale_data`、`test_qlib_backtest_runs`、`test_experiment_agent_uses_qlib_tool_real_model` |
 | Qlib 模型训练 | `qlib_model.py`：Alpha158 + 梯度提升树（LightGBM 不可用时 sklearn），Qlib workflow 记录，Harness 口径评估，测试段按配置加锁，调仓相位区间 | `test_qlib_model_train_alpha158`、`test_registry_exprs_keep_registered_direction` |
-| 自动找研报 | `report_fetch.py`：标题筛选、下载校验、程序和模型两道预筛（程序复核模型结论）、状态落盘 | `test_report_fetch_title_filter`、`test_report_fetch_pipeline_offline`、`test_web_api_reports_joins_runs` |
+| 自动找研报 | `report_fetch.py`：标题筛选、下载校验、程序和模型两道预筛（程序复核模型结论）、状态落盘 | `test_report_fetch_title_filter`、`test_report_fetch_pipeline_offline`、`test_report_inbox_scan_dedup_and_screen`、`test_web_api_reports_joins_runs` |
 | 前端 | `web.py`：只读接口 + 白名单任务（研究运行、每日任务）；路径和上传校验；`web/` 的 React 页面 | `test_web_api_reads_runs_and_guards_paths` |
 | 滚动训练 | `qlib_model.folds` / `walk_forward`：扩张或固定窗口，训练 / 验证 / 预测间隔 embargo，逐折和整体样本外评估 | `test_walk_forward_folds_have_embargo`、`test_walk_forward_runs_and_locks_test` |
 | 候选并行 | `FactorHarness.run(workers=N)`：线程池；共享状态加锁；trace 带候选标签 | `test_duplicate_check_is_atomic_across_threads`、`test_tracer_tags_events_per_thread`、`test_parallel_candidates_real_model` |
@@ -406,6 +418,6 @@ QH_ENV_FILE=path/to/.env .venv/bin/python -m pytest -q
 - PDF 解析针对「图表 N：标题 … 来源：」这种文字排版的券商研报；扫描件、图片里的表格、公式的上下标结构（只保留了拆行后的顺序）都没有处理。
 - 东方财富上公开的个股量价金工研报很少；日频可验证的研报需要自己提供 PDF。
 - `--llm openai` 路径尚未实测。
-- 自动找研报只接了东方财富研报中心，公开的金工因子研报很少（见「自动找研报」）；需要登录的来源（慧博、萝卜投研、券商官网）没有接。
+- 自动找研报只接了东方财富研报中心，公开的金工因子研报很少（见「自动找研报」）；需要登录的来源（慧博、萝卜投研、券商官网）不自动下载，用收件夹接入你自己下载的文件。
 - Qlib 接了数据、表达式计算、回测复核和模型训练（Alpha158 + 梯度提升树，用 Python 搭的 workflow，没有用 `qrun` 的 YAML 配置）；评估（中性化 RankIC、Newey-West、分段检验）仍是自己的实现。这台机器上 LightGBM 因缺 libomp 加载不了，实测用的是 sklearn 的同类模型。滚动训练的样本外只有 2.2 年、9 个季度，扣费后超额为负。自带 `--csv` 行情时不启用 Qlib。
 - 续跑时，中断那一刻正在执行的节点会重做一次（比如正在等模型返回的「生成代码」）；节点里写经验库的操作因此可能重复一次，经验库会把近似重复的记录合并。

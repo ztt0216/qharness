@@ -339,7 +339,7 @@ def cmd_qlib_train(args) -> dict:
 
 
 def cmd_reports(args):
-    from .report_fetch import ReportIndex, research, run_pipeline
+    from .report_fetch import INBOX, ReportIndex, research, run_inbox, run_pipeline
 
     if args.env_file:
         load_env_file(args.env_file)
@@ -347,6 +347,20 @@ def cmd_reports(args):
     if args.action == "fetch":
         llm = None if args.no_screen else make_llm(args.llm)
         return run_pipeline(args.days, args.download, args.research, llm, index)
+    if args.action in ("scan", "watch"):
+        llm = None if args.no_screen else make_llm(args.llm)
+        inbox = Path(args.inbox) if args.inbox else INBOX
+        if args.action == "scan":
+            return run_inbox(llm, args.research, index, inbox)
+        print(f"监视 {inbox}，每 {args.interval} 秒扫描一次（Ctrl-C 结束）")
+        r = None
+        try:
+            while True:
+                r = run_inbox(llm, args.research, ReportIndex(), inbox,
+                              log=lambda m: print(time.strftime("%H:%M:%S"), m, flush=True))
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            return r
     if args.action == "list":
         for x in sorted(index.items.values(), key=lambda x: x.get("date", ""), reverse=True):
             print(f"{x.get('date')}  [{x.get('status')}]  {x.get('org')}《{x.get('title')}》  {x.get('reason', '')}")
@@ -397,11 +411,14 @@ def main(argv=None):
     qd.add_argument("--data", default=str(DEFAULT_CACHE))
     qd.add_argument("--out", default=str(DEFAULT_QLIB))
     rp = sub.add_parser("reports", help="自动找研报：东方财富策略类研报 → 标题筛选 → 下载 → 预筛 → 研究")
-    rp.add_argument("action", choices=["fetch", "list", "run"],
-                    help="fetch：搜集、下载并预筛；list：查看索引；run：研究已通过预筛的研报")
+    rp.add_argument("action", choices=["fetch", "scan", "watch", "list", "run"],
+                    help="fetch：从东方财富搜集、下载并预筛；scan：扫描收件夹并预筛新文件；watch：持续监视收件夹；"
+                         "list：查看索引；run：研究已通过预筛的研报")
+    rp.add_argument("--inbox", help="收件夹（默认 data/reports/inbox）：自己下载的研报放进去")
+    rp.add_argument("--interval", type=int, default=60, help="watch：每隔多少秒扫描一次")
     rp.add_argument("--days", type=int, default=30, help="fetch：往前找多少天")
     rp.add_argument("--download", type=int, default=10, help="fetch：最多下载多少篇")
-    rp.add_argument("--research", type=int, default=0, help="fetch：预筛之后接着研究多少篇（默认 0，只筛不跑）")
+    rp.add_argument("--research", type=int, default=0, help="fetch / scan / watch：预筛之后接着研究多少篇（默认 0，只筛不跑）")
     rp.add_argument("--top", type=int, default=1, help="run：研究最新的几篇")
     rp.add_argument("--code", help="run：指定研报编号")
     rp.add_argument("--no-screen", action="store_true", help="fetch：不调用模型预筛")
