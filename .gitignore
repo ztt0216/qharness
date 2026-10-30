@@ -8,3 +8,6 @@ portfolio/
 *.pyc
 /private/
 /Users/
+web/node_modules/
+web/dist/
+.claude/launch.json

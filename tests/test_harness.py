@@ -709,3 +709,39 @@ def test_walk_forward_runs_and_locks_test(df, risk, qlib_env, tmp_path):
     assert s["oos"]["model"]["n_days"] > 100 and "test" in s["by_segment"]
     with pytest.raises(_Locked):
         walk_forward(Evaluator(df, risk=risk, test_log=str(tmp_path / "o.txt")), tmp_path / "wf2", **kw)
+
+
+def test_web_api_reads_runs_and_guards_paths(tmp_path):
+    """前端后端：读运行记录；运行编号、研报路径、上传格式都做校验。"""
+    import json as _json
+    from fastapi.testclient import TestClient
+    from qharness.web import create_app
+
+    rid = "20261031-000000-abcdef"
+    d = tmp_path / "runs" / rid
+    d.mkdir(parents=True)
+    (d / "args.json").write_text(_json.dumps({"report": "samples/r.md"}), encoding="utf-8")
+    (tmp_path / "samples").mkdir()
+    (tmp_path / "samples" / "r.md").write_text("# 标题\n<!-- page: 1 -->\n## 核心观点\n正文", encoding="utf-8")
+    events = [{"node": "run.start", "ts": 1.0, "step": 0, "model": "m"},
+              {"node": "sop.topic", "ts": 2.0, "step": 1, "output": {"theme": "量价"}},
+              {"node": "candidate.start", "ts": 3.0, "step": 2, "hypothesis": {"name": "a"}},
+              {"node": "candidate.end", "ts": 4.0, "step": 3, "status": "rejected"}]
+    (d / "trace.jsonl").write_text("\n".join(_json.dumps(e, ensure_ascii=False) for e in events) + "\n{\"node\": ",
+                                   encoding="utf-8")  # 最后一行写到一半：跳过，不报错
+    (d / "results.json").write_text(_json.dumps([{"hypothesis": {"name": "a"}, "status": "rejected"}]), encoding="utf-8")
+    (d / "summary.md").write_text("# x", encoding="utf-8")
+
+    c = TestClient(create_app(tmp_path))
+    runs = c.get("/api/runs").json()
+    assert runs[0]["id"] == rid and runs[0]["theme"] == "量价" and runs[0]["counts"] == {"rejected": 1}
+    assert runs[0]["state"] == "finished" and runs[0]["report"] == "r.md"
+    detail = c.get(f"/api/runs/{rid}").json()
+    assert detail["report"].startswith("# 标题") and len(detail["trace"]) == 4
+    assert c.get("/api/runs/..%2F..%2Fetc").status_code == 404
+    assert c.get("/api/runs/20261031-000000-zzzzzz").status_code == 404
+    assert c.post("/api/uploads", files={"file": ("x.exe", b"MZ")}).status_code == 400
+    ok = c.post("/api/uploads", files={"file": ("研报 1.md", "正文".encode())}).json()
+    assert ok["value"].startswith("uploads/") and (tmp_path / "runs" / ok["value"]).exists()
+    assert c.post("/api/jobs/run", json={"report": "../qharness/cli.py"}).status_code == 400
+    assert c.get("/api/paper").json()["account"] is None

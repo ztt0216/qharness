@@ -37,6 +37,15 @@ uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python -r requi
 .venv/bin/python -m qharness update && .venv/bin/python -m qharness daily --paper
 ```
 
+前端（需要 Node 20+；构建一次之后由 `serve` 托管，打开 http://127.0.0.1:8765）：
+
+```bash
+cd web && npm install && npm run build && cd ..
+QH_ENV_FILE=path/to/.env .venv/bin/python -m qharness serve
+```
+
+开发时可以 `cd web && npm run dev`，接口自动转给 8765 端口。
+
 ## 命令
 
 | 命令 | 作用 | 产出 |
@@ -49,6 +58,7 @@ uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python -r requi
 | `daily` | 因子库 + 登记因子等权合成，在最新成分里选 TopK，对比上次持仓给出买卖清单 | `portfolio/<日期>.csv` |
 | `daily --paper` | 同上，并更新模拟账户：上次挂单在之后第一个交易日开盘撮合、逐日记净值，到调仓周期挂新单 | `portfolio/account.json`、`account.trades.csv` |
 | `paper-sim` | 模拟账户历史回放（默认测试段），输出净值、成交记录，并和同区间回测对照 | `runs/paper_sim/` |
+| `serve` | 本地前端：研究运行的审计轨迹（出处跳回研报原文）、因子库、模型逐折结果、模拟账户；可上传研报发起研究、更新行情并结算 | — |
 | `factors` | 查看登记因子（代码、各段指标、来源 run） | — |
 | `eval-research` | 研究层评测集打分 | `runs/research_eval.json` |
 | `experience` | 查看经验库 | — |
@@ -193,6 +203,17 @@ baostock 并发太高会封 IP，东财接口会断连接，所以下载都是�
 - 扣掉费用后，样本外年化超额中位数 -2.7%：排序能力有，但不足以覆盖 5 天一调仓的换手成本。基线更差（-10.8%）。
 - 每一折的最优轮数都是第一次检查时的 20 棵树：验证段 L2 从一开始就上升，说明训练段学到的关系到验证段就衰减了。还没有用更细的早停步长或更强的正则去调，调了要再开一次测试段，会留下记录。
 
+### 前端（`qharness serve`）
+
+FastAPI（`qharness/web.py`）+ React（`web/`，Vite + TypeScript）。后端只读项目里的运行记录和账户文件，另外能发起两类后台任务：研究运行（`run --report ... --run-id ...`）和每日任务（`update` 后 `daily --paper`）。只监听 127.0.0.1，运行编号和研报路径都校验过，上传只收 PDF / PPT / Markdown / 纯文本。
+
+- **研究运行**：每次运行的审计轨迹，按流程排开：切分研报 → 定位主题 → 抽取观点 → 形成假设 → 每个候选每一轮的实现（Qlib 表达式或 Python）、沙箱检查、各段 RankIC、研究层判定和触发的规则 → 策略对照。左边是解析后的研报原文，点观点或假设上的出处（如「量价关系的市场含义 p3」），左边滚到那一页并高亮。运行中每 2 秒刷新，显示日志。
+- **发起研究**：选示例研报或上传，选并行数，提交后直接跳到这次运行的页面看进度。
+- **模型**：滚动训练逐折的 RankIC 柱状图（模型和基线对比）、逐折表格、单次切分结果。没有「重新训练」按钮：同一配置的测试段只能开一次，按钮会让人在测试段上反复挑结果；换配置走命令行，每次都有记录。
+- **模拟账户**：净值、持仓（成本价、当日涨跌、浮动盈亏，按不复权价计）、下一交易日目标持仓、历史回放净值曲线、成交记录；「更新行情并结算」按钮跑每日任务。
+- **视觉**：涨红跌绿按 A 股习惯，并且数字一律带正负号，不只靠颜色；状态用图标加文字。图表是手写 SVG，按 dataviz 规范（2px 线、≤24px 柱、4px 圆角、细网格、悬停提示）；深色模式单独配色；手机宽度可用。设计参考了 Anthropic 官方的 frontend-design skill（`.claude/skills/frontend-design/`，Apache-2.0）。
+- **实测**：在页面上选示例研报发起研究，22 秒完成；两个候选因为经验库里已有相同方向被淘汰的记录，直接跳过，页面上显示了当时的判定原因。
+
 ### 因子方向由 Harness 施加
 
 实验层看不到 `direction`，只按 `calculation` 原样实现；执行前 `sandbox.with_direction` 按假设方向包一层（Python 代码包一个取负的 `factor`，Qlib 表达式包成 `-1*(…)`），之后的评估、去重、测试段、登记都用包过的版本。
@@ -288,6 +309,7 @@ baostock 并发太高会封 IP，东财接口会断连接，所以下载都是�
 | 方向由 Harness 施加 | `sandbox.with_direction`；实验层提示词不含 direction；只翻方向时跳过重新生成 | `test_direction_applied_by_harness`、`test_coder_does_not_see_direction` |
 | Qlib | `qlib_bridge.py`：数据转换、表达式白名单、和行情一致性检查、TopkDropout 回测复核 | `test_qlib_expression_matches_pandas`、`test_qlib_expression_static_rules`、`test_qlib_rejects_stale_data`、`test_qlib_backtest_runs`、`test_experiment_agent_uses_qlib_tool_real_model` |
 | Qlib 模型训练 | `qlib_model.py`：Alpha158 + 梯度提升树（LightGBM 不可用时 sklearn），Qlib workflow 记录，Harness 口径评估，测试段按配置加锁，调仓相位区间 | `test_qlib_model_train_alpha158`、`test_registry_exprs_keep_registered_direction` |
+| 前端 | `web.py`：只读接口 + 白名单任务（研究运行、每日任务）；路径和上传校验；`web/` 的 React 页面 | `test_web_api_reads_runs_and_guards_paths` |
 | 滚动训练 | `qlib_model.folds` / `walk_forward`：扩张或固定窗口，训练 / 验证 / 预测间隔 embargo，逐折和整体样本外评估 | `test_walk_forward_folds_have_embargo`、`test_walk_forward_runs_and_locks_test` |
 | 候选并行 | `FactorHarness.run(workers=N)`：线程池；共享状态加锁；trace 带候选标签 | `test_duplicate_check_is_atomic_across_threads`、`test_tracer_tags_events_per_thread`、`test_parallel_candidates_real_model` |
 | 去重 | `orchestrator.factor_key`（同一因子才跳过已淘汰方向）、`_duplicate_of`（按因子值） | `test_factor_key_same_factor_only`、`test_duplicate_by_values` |

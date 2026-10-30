@@ -105,7 +105,7 @@ RESUMABLE_ARGS = ("report", "hypothesis", "llm", "csv", "data", "experience", "r
 def build(args):
     if args.env_file:
         print(f"从 env 文件读取：{', '.join(load_env_file(args.env_file))}")
-    tr = Tracer(args.runs, args.resume)
+    tr = Tracer(args.runs, args.resume or getattr(args, "run_id", None))
     if args.resume:  # 续跑：沿用原运行的参数（研报、数据、经验库等），保证接上的是同一个任务
         saved = json.loads((tr.dir / "args.json").read_text(encoding="utf-8"))
         for k in RESUMABLE_ARGS:
@@ -370,6 +370,9 @@ def main(argv=None):
     qd = sub.add_parser("qlib-dump", help="把行情缓存转成 Qlib 数据目录（update 之后会自动重做）")
     qd.add_argument("--data", default=str(DEFAULT_CACHE))
     qd.add_argument("--out", default=str(DEFAULT_QLIB))
+    sv = sub.add_parser("serve", help="本地前端：运行记录、审计轨迹、因子库、模型、模拟账户；可发起研究运行")
+    sv.add_argument("--host", default="127.0.0.1")
+    sv.add_argument("--port", type=int, default=8765)
     qt = sub.add_parser("qlib-train", help="Qlib 模型训练：Alpha158 特征 + 梯度提升树，测试段评估和回测")
     qt.add_argument("--data", default=str(DEFAULT_CACHE))
     qt.add_argument("--registry", default=str(ROOT / "factors"))
@@ -397,6 +400,7 @@ def main(argv=None):
         s.add_argument("--no-strategy", action="store_true")
         s.add_argument("--registry", default=str(ROOT / "factors"))
         s.add_argument("--resume", metavar="RUN_ID", help="从检查点续跑中断的运行（沿用原运行的参数）")
+        s.add_argument("--run-id", help="指定新运行的编号（前端发起运行时用来跟踪进度）")
         s.add_argument("--no-checkpoint", action="store_true", help="不写检查点")
         s.add_argument("--no-qlib", action="store_true", help="不启用 Qlib（即使有 Qlib 数据目录）")
         s.add_argument("--workers", type=int, default=1,
@@ -436,6 +440,9 @@ def main(argv=None):
 
     if args.cmd == "qlib-dump":
         return cmd_qlib_dump(Path(args.data), Path(args.out))
+    if args.cmd == "serve":
+        from .web import serve
+        return serve(args.host, args.port)
     if args.cmd == "qlib-train":
         return cmd_qlib_train(args)
     if args.cmd == "update":
