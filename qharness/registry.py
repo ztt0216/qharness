@@ -45,6 +45,19 @@ class FactorRegistry:
         out = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(self.root.glob("*.json"))]
         return [x for x in out if x.get("active", True) or not active_only]
 
+    def set_active(self, name: str, active: bool, reason: str = "", health: dict | None = None) -> dict:
+        """启用 / 停用一个登记因子，历次变更追加到 history（谁、何时、为什么）。"""
+        path = self.root / f"{self.slug(name)}.json"
+        if not path.exists():
+            raise KeyError(f"登记表里没有因子「{name}」")
+        x = json.loads(path.read_text(encoding="utf-8"))
+        x["active"] = active
+        x.setdefault("history", []).append({"at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                            "action": "activate" if active else "deactivate",
+                                            "reason": reason, "health": health})
+        path.write_text(json.dumps(x, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        return x
+
     def compute(self, df: pd.DataFrame) -> dict[str, pd.Series]:
         """在最新数据上重新跑一遍登记因子（同样过沙箱检查）；跑不通的跳过并报出来。"""
         out = {}

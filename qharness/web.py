@@ -252,6 +252,20 @@ def create_app(root: Path = ROOT) -> FastAPI:
                              {"name": "illiquidity_20d", "desc": "20 日非流动性：|日收益率| / 成交额 的 20 日均值（Amihud）"},
                              {"name": "low_turnover_20d", "desc": "20 日低换手：-换手率 20 日均值"}]}
 
+    @app.get("/api/monitor")
+    def monitor():
+        return _json(P.runs / "monitor" / "latest.json")
+
+    @app.get("/api/daily")
+    def daily():
+        from . import schedule as sch
+        from .daily_job import history
+
+        st = sch.status() if root == ROOT else {"installed": False, "loaded": False}  # 测试用临时目录时不查本机
+        if st.get("slots"):
+            st["describe"] = sch.describe(st["slots"])
+        return {"history": history(P.runs, 20)[::-1], "schedule": st}
+
     @app.get("/api/models")
     def models():
         out = []

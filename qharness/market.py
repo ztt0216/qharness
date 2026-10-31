@@ -188,7 +188,21 @@ def current_constituents(cache: Path = DEFAULT_CACHE) -> list[str]:
     return codes
 
 
-def update(cache: Path = DEFAULT_CACHE, end: str | None = None, pause: float = 1.0, overlap: int = 10) -> dict:
+def update(cache: Path = DEFAULT_CACHE, end: str | None = None, pause: float = 1.0, overlap: int = 10,
+           net_timeout: float = 30.0) -> dict:
+    """net_timeout：每次网络读写的超时秒数。akshare 内部发请求不带超时，服务器不回数据时会一直等
+    （实测一次卡了 7 个多小时）；这里设全局默认超时，超时的股票记为失败，接着处理下一只。"""
+    import socket
+
+    prev = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(net_timeout)
+    try:
+        return _update(cache, end, pause, overlap)
+    finally:
+        socket.setdefaulttimeout(prev)
+
+
+def _update(cache: Path, end: str | None, pause: float, overlap: int) -> dict:
     """每日增量更新：刷新成分 → 新成分股补全历史 → 已有股票追加最近几天（新浪后复权）。
 
     缓存里的后复权价可能来自 baostock，基准和新浪不同：用重叠区间最后一天的收盘价比值把新数据缩放后拼接，
@@ -206,6 +220,8 @@ def update(cache: Path = DEFAULT_CACHE, end: str | None = None, pause: float = 1
     stats = {"appended": 0, "up_to_date": 0, "no_new_data": 0, "failed": [], "new": new}
     codes = sorted(known | set(current))
     for i, code in enumerate(codes):
+        if i and i % 50 == 0:
+            print(f"  已处理 {i}/{len(codes)} 只（追加 {stats['appended']}，失败 {len(stats['failed'])}）", flush=True)
         f = cache / f"{code}.csv"
         if not f.exists():
             continue

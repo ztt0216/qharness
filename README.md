@@ -31,10 +31,16 @@ uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python -r requi
 .venv/bin/python -m qharness run --report 研报.md --env-file path/to/.env
 ```
 
-每日（收盘后，可放进 cron）：
+每日（收盘后）：
 
 ```bash
-.venv/bin/python -m qharness update && .venv/bin/python -m qharness daily --paper
+.venv/bin/python -m qharness daily-job
+```
+
+定时自动跑（macOS，北京时间周一到周五 17:30 / 18:30 / 19:30）：
+
+```bash
+.venv/bin/python -m qharness schedule install
 ```
 
 前端（需要 Node 20+；构建一次之后由 `serve` 托管，打开 http://127.0.0.1:8765）：
@@ -62,6 +68,10 @@ QH_ENV_FILE=path/to/.env .venv/bin/python -m qharness serve
 | `reports scan` / `watch` | 收件夹：自己下载的研报放进 `data/reports/inbox/`，扫描一次或持续监视（`--interval` 秒），新文件预筛后排队（`--research N` 接着研究） | 同上 |
 | `eval-retrieval` | 检索评测：字面 / 语义 / 混合三种方式在真实运行记录上对比（研报检索、改写查询、同一因子识别） | `runs/retrieval_eval.json` |
 | `serve` | 本地前端：研究运行的审计轨迹（出处跳回研报原文）、因子库、模型逐折结果、模拟账户；可上传研报发起研究、更新行情并结算 | — |
+| `daily-job` | 每日任务：更新行情 → 因子衰减监控 → 每日持仓和模拟账户结算；按北京时间判断，当天处理完不重复，没有新行情等下一次 | `runs/daily/status.jsonl`、`runs/daily/<日期>.log` |
+| `schedule install` / `status` / `uninstall` | 用 launchd 定时跑 `daily-job`（用户级，不需要管理员权限；`--dry-run` 只看配置） | `~/Library/LaunchAgents/com.qharness.daily.plist` |
+| `monitor` | 因子衰减监控：最近 120 个有标签的交易日重新评估，失效的登记因子自动停用（`--dry-run` 只报告） | `runs/monitor/<日期>.json` |
+| `factors --activate` / `--deactivate` | 人工启用 / 停用登记因子，记进登记表的历史 | `factors/*.json` |
 | `factors` | 查看登记因子（代码、各段指标、来源 run） | — |
 | `eval-research` | 研究层评测集打分 | `runs/research_eval.json` |
 | `experience` | 查看经验库 | — |
@@ -310,6 +320,21 @@ FastAPI（`qharness/web.py`）+ React（`web/`，Vite + TypeScript）。后端�
   - **真实交易日**：账户 2026-10-29 收盘挂单，10-30 开盘 20 笔全部成交（成交额 98.0 万，费用 245 元），10-30 收盘净值 997,856。之后每天收盘后 `update && daily --paper` 接着跑。注意新浪一般收盘后 1~2 小时才发布当天数据，太早运行 `update` 会显示 `no_new_data`。
   - **为什么之前对不上**：不加滑点时，模拟账户的年化超额是 +5.5%。差距主要来自回测按单边 0.15% 扣成本，而账户只算了佣金和印花税；加上滑点后两者对齐。
 
+### 投入使用：每日任务、衰减监控、定时运行
+
+- **每日任务**（`daily_job.py`）：更新行情 → 因子衰减监控 → 每日持仓和模拟账户结算，监控放在选股之前，当天停用的因子不进组合。
+  - 按北京时间判断：周末、收盘前（16:00 前）直接跳过。
+  - 幂等：当天处理完就退出，不联网，所以一晚上可以触发多次；数据源还没发布当天行情（或节假日）记为 no_new_data，等下一次。
+  - 行情更新了但后面的步骤失败：下一次从监控接着做，不重复更新。每次的结果追加到 `runs/daily/status.jsonl`。
+  - 防卡死：akshare 内部发请求不带超时，实测有一次 SSL 读取卡了 7 个多小时。现在更新行情时设全局网络超时 30 秒（超时的股票记为失败、接着下一只），整个任务另有 2 小时时限（正常全量更新约 7 秒一只、380 只约 45 分钟）。
+- **衰减监控**（`monitor.py`）：规则和研究层一样预先定好。
+  - 窗口：最近 120 个已经有标签的交易日（最近 6 天还没有标签）。
+  - 停用：登记因子中性化 RankIC ≤ 0 且 Newey-West t ≤ −1（方向反了，而且不是偶然），写回登记表（`active=false`，记下日期、原因、当时的指标）。
+  - 警告：最近 60 天 RankIC 转负，或 120 天 RankIC 不到登记时测试段的一半。
+  - 基础因子只报告，不停用。重新启用要人工确认：`qharness factors --activate 名称`。
+  - 实测（数据到 2026-10-30）：5 个基础因子里 20 日动量最近 120 天 RankIC −0.046（t −1.97），60 天 −0.059，报警告；如果它是登记因子，已经满足停用条件。其余 4 个正常。
+- **定时运行**（`schedule.py`）：macOS launchd 用户级任务，北京时间周一到周五 17:30、18:30、19:30 各触发一次（新浪一般收盘后 1~2 小时才发布当天行情），按安装时的时差换算成本机时间；电脑睡眠时错过的触发，唤醒后补跑一次。前端「模拟账户」页显示定时任务状态和最近几次的结果，「因子库」页显示衰减监控。
+
 ### 候选并行
 
 `run --workers N`（默认 1）：候选之间用线程池并行，每个候选还是一张独立的图、一个检查点 thread。时间主要花在等模型返回，因子执行在子进程里，所以线程就够用。
@@ -371,6 +396,7 @@ FastAPI（`qharness/web.py`）+ React（`web/`，Vite + TypeScript）。后端�
 | 自动找研报 | `report_fetch.py`：标题筛选、下载校验、程序和模型两道预筛（程序复核模型结论）、状态落盘 | `test_report_fetch_title_filter`、`test_report_fetch_pipeline_offline`、`test_report_inbox_scan_dedup_and_screen`、`test_web_api_reports_joins_runs` |
 | 前端 | `web.py`：只读接口 + 白名单任务（研究运行、每日任务）；路径和上传校验；`web/` 的 React 页面 | `test_web_api_reads_runs_and_guards_paths` |
 | 滚动训练 | `qlib_model.folds` / `walk_forward`：扩张或固定窗口，训练 / 验证 / 预测间隔 embargo，逐折和整体样本外评估 | `test_walk_forward_folds_have_embargo`、`test_walk_forward_runs_and_locks_test` |
+| 投入使用 | `daily_job.py`（幂等、按北京时间、失败续做）、`monitor.py`（衰减监控与自动停用）、`schedule.py`（launchd） | `test_daily_job_idempotent_and_resumes`、`test_monitor_deactivates_decayed_factor` |
 | 候选并行 | `FactorHarness.run(workers=N)`：线程池；共享状态加锁；trace 带候选标签 | `test_duplicate_check_is_atomic_across_threads`、`test_tracer_tags_events_per_thread`、`test_parallel_candidates_real_model` |
 | 去重 | `orchestrator.factor_key`（同一因子才跳过已淘汰方向）、`_duplicate_of`（按因子值） | `test_factor_key_same_factor_only`、`test_duplicate_by_values` |
 

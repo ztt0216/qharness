@@ -12,6 +12,7 @@ export default function Paper() {
   const job = useApi<Job>(jobId ? `/api/jobs/${jobId}` : null, (d) => (!d || d.status === "running" ? 2000 : undefined));
   const running = job.data?.status === "running";
   const paper = useApi<any>("/api/paper", running ? 4000 : undefined);
+  const daily = useApi<any>("/api/daily");
   const jobStatus = job.data?.status;
   const reloadPaper = paper.reload;
   useEffect(() => { if (jobStatus && jobStatus !== "running") reloadPaper(); }, [jobStatus, reloadPaper]);  // 任务结束后再取一次，轮询停之前的最后一次可能早于任务完成
@@ -89,6 +90,47 @@ export default function Paper() {
             </div>
           </section>
         </>
+      )}
+
+      {daily.data && (
+        <section className="section">
+          <div className="section-head">
+            <h2>自动运行</h2>
+            <span className="note">
+              {daily.data.schedule.loaded ? `定时任务已安装：${daily.data.schedule.describe ?? ""}` : "定时任务未安装"}
+            </span>
+          </div>
+          <p className="ink2" style={{ marginBottom: 12 }}>
+            每日任务按顺序做三件事：更新行情 → 因子衰减监控（失效的登记因子先停用）→ 选股、结算模拟账户。
+            北京时间周一到周五 17:30、18:30、19:30 各触发一次，当天处理完就不再重复；数据源还没发布行情就等下一次。
+            {!daily.data.schedule.loaded && <> 安装：<code>python -m qharness schedule install</code>（macOS，用户级，不需要管理员权限）。</>}
+            {daily.data.schedule.loaded && daily.data.schedule.points_here === false && <> 注意：已安装的定时任务指向另一个目录。</>}
+          </p>
+          {daily.data.history.length > 0 ? (
+            <div className="table-scroll">
+              <table className="data">
+                <thead><tr><th>北京时间</th><th>结果</th><th>交易日</th><th>步骤</th><th className="r">净值</th><th>说明</th></tr></thead>
+                <tbody>
+                  {daily.data.history.slice(0, 10).map((h: any, i: number) => {
+                    const label: Record<string, [string, string, string]> = {
+                      done: ["accepted", "✓", "完成"], no_new_data: ["skipped", "·", "无新行情"], failed: ["failed", "✕", "失败"] };
+                    const [cls, ic, text] = label[h.outcome] ?? ["skipped", "·", h.outcome];
+                    return (
+                      <tr key={i}>
+                        <td className="num">{h.beijing}</td>
+                        <td><span className={`verdict ${cls}`}><span className="ic" aria-hidden>{ic}</span>{text}</span></td>
+                        <td className="num">{h.date}</td>
+                        <td className="small ink2">{(h.steps ?? []).join(" → ") || "—"}</td>
+                        <td className="r">{h.nav?.nav ? money(h.nav.nav) : "—"}</td>
+                        <td className="small ink2">{h.error ?? h.note ?? (h.deactivated?.length ? `停用 ${h.deactivated.join("、")}` : "")}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : <p className="small muted">还没有自动运行记录。</p>}
+        </section>
       )}
 
       {target.rows.length > 0 && (

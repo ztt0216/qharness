@@ -889,3 +889,83 @@ def test_retrieval_modes(monkeypatch):
     assert similarity(a, b) < 0.3 and R.maybe_same(a, b)            # 字面过不了线，语义通道召回
     monkeypatch.setenv("QH_RETRIEVAL", "lexical")
     assert not R.maybe_same(a, b)
+
+
+def test_monitor_deactivates_decayed_factor(df, risk, tmp_path, monkeypatch):
+    """衰减监控：最近窗口里方向反了且显著的登记因子被停用（写回登记表，带原因和历史）；基础因子只报告。"""
+    from qharness.monitor import run_monitor
+    from qharness.data import make_label
+
+    reg = FactorRegistry(tmp_path / "f")
+    reg.add("失效因子", GOOD, {"name": "失效因子"}, {}, {"test": {"rank_ic": 0.05, "valid": True}}, "r1")
+    reg.add("正常因子", GOOD, {"name": "正常因子"}, {}, {"test": {"rank_ic": 0.05, "valid": True}}, "r2")
+    noise = np.random.default_rng(0).normal(size=len(df))
+    lab = make_label(df)
+    monkeypatch.setattr(FactorRegistry, "compute", lambda self, d: {
+        "失效因子": -lab + 0.02 * noise,           # 和未来收益反着走（只在测试里直接给值，不过沙箱）
+        "正常因子": lab + 0.02 * noise})
+    res = run_monitor(df, risk, reg, tmp_path / "mon", log=lambda m: None)
+    st = {r["name"]: r for r in res["factors"]}
+    assert st["失效因子"]["status"] == "deactivate" and st["正常因子"]["status"] == "ok"
+    assert res["deactivated"] == ["失效因子"] and {r["kind"] for r in res["factors"]} == {"registered", "baseline"}
+    assert [x["name"] for x in reg.items()] == ["正常因子"]
+    x = [x for x in reg.items(active_only=False) if x["name"] == "失效因子"][0]
+    assert x["active"] is False and x["history"][-1]["action"] == "deactivate" and "方向反了" in x["history"][-1]["reason"]
+    assert (tmp_path / "mon" / "latest.json").exists()
+    reg.set_active("失效因子", True, reason="人工确认")
+    assert len(reg.items()) == 2
+
+
+def test_daily_job_idempotent_and_resumes(tmp_path):
+    """每日任务：周末、收盘前跳过；处理过当天就不再联网；没有新行情记 no_new_data；中途失败下次从监控接着做。"""
+    from datetime import datetime
+    from qharness.daily_job import BEIJING, history, run_daily_job
+
+    cache = tmp_path / "data"
+    cache.mkdir()
+    f = cache / "sh.600000.csv"
+    f.write_text("date,code,close\n2026-10-30,sh.600000,1\n", encoding="utf-8")
+    calls = []
+
+    def update(c):
+        calls.append("update")
+        if update.publish:
+            f.write_text(f.read_text() + f"{update.publish},sh.600000,1\n")
+        return {"appended": int(bool(update.publish)), "no_new_data": int(not update.publish), "failed": []}
+    update.publish = None
+    daily = {"fail": False}
+
+    def run_daily():
+        calls.append("daily")
+        if daily["fail"]:
+            raise RuntimeError("撮合出错")
+        return {"nav": 1.0}
+    steps = {"update": update, "monitor": lambda: calls.append("monitor") or {"deactivated": []}, "daily": run_daily}
+    job = lambda h, d="2026-11-02": run_daily_job(tmp_path, cache, tmp_path / "f", tmp_path / "p", steps=steps,  # noqa: E731
+                                                 now=datetime.fromisoformat(f"{d}T{h}").replace(tzinfo=BEIJING))
+    assert job("18:00", "2026-10-31")["note"] == "周末" and job("15:00")["outcome"] == "skipped" and not calls
+    assert job("17:30")["outcome"] == "no_new_data" and calls == ["update"]           # 数据源还没发布
+    update.publish, daily["fail"] = "2026-11-02", True
+    assert job("18:30")["outcome"] == "failed" and calls[-3:] == ["update", "monitor", "daily"]
+    daily["fail"], calls[:] = False, []
+    r = job("19:30")
+    assert r["outcome"] == "done" and calls == ["monitor", "daily"]                   # 行情已更新：不重复更新
+    calls.clear()
+    assert job("20:30")["outcome"] == "skipped" and not calls                         # 当天已处理：不联网
+    assert [h["outcome"] for h in history(tmp_path / "runs")] == ["no_new_data", "failed", "done"]
+
+
+def test_daily_job_time_limit(tmp_path):
+    """某一步卡住（比如网络请求一直不返回）：到总时限记为失败退出，不会一直挂着挡住之后的定时触发。"""
+    import time as _time
+    from datetime import datetime
+    from qharness.daily_job import BEIJING, run_daily_job
+
+    cache = tmp_path / "data"
+    cache.mkdir()
+    (cache / "sh.600000.csv").write_text("date,code,close\n2026-10-30,sh.600000,1\n", encoding="utf-8")
+    steps = {"update": lambda c: _time.sleep(30), "monitor": lambda: {}, "daily": lambda: None}
+    t = _time.time()
+    r = run_daily_job(tmp_path, cache, tmp_path / "f", tmp_path / "p", steps=steps, max_seconds=1,
+                      now=datetime(2026, 11, 2, 18, 0, tzinfo=BEIJING))
+    assert r["outcome"] == "failed" and "超过 1 秒" in r["error"] and _time.time() - t < 5

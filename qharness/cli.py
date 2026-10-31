@@ -487,6 +487,21 @@ def main(argv=None):
     ps.add_argument("--out", default=str(ROOT / "runs" / "paper_sim"))
     f = sub.add_parser("factors")
     f.add_argument("--registry", default=str(ROOT / "factors"))
+    f.add_argument("--activate", metavar="名称", help="重新启用一个被停用的登记因子（人工确认后）")
+    f.add_argument("--deactivate", metavar="名称", help="人工停用一个登记因子")
+    f.add_argument("--reason", default="", help="启用 / 停用的原因，记进登记表")
+    mo = sub.add_parser("monitor", help="因子衰减监控：最近 120 个有标签的交易日重新评估，失效的登记因子自动停用")
+    mo.add_argument("--data", default=str(DEFAULT_CACHE))
+    mo.add_argument("--registry", default=str(ROOT / "factors"))
+    mo.add_argument("--dry-run", action="store_true", help="只报告，不停用")
+    dj = sub.add_parser("daily-job", help="每日任务（给定时任务调用）：更新行情 → 衰减监控 → 每日持仓和模拟账户结算；幂等")
+    dj.add_argument("--data", default=str(DEFAULT_CACHE))
+    dj.add_argument("--registry", default=str(ROOT / "factors"))
+    dj.add_argument("--out", default=str(ROOT / "portfolio"))
+    dj.add_argument("--force", action="store_true", help="不管时间和是否处理过，强制跑一遍")
+    sc = sub.add_parser("schedule", help="定时运行每日任务（macOS launchd）")
+    sc.add_argument("action", choices=["install", "status", "uninstall"])
+    sc.add_argument("--dry-run", action="store_true", help="install：只显示要写入的配置，不安装")
     r = sub.add_parser("eval-research")
     r.add_argument("--llm", choices=["anthropic", "openai"], default="anthropic")
     r.add_argument("--env-file")
@@ -519,6 +534,39 @@ def main(argv=None):
         return cmd_daily(args)
     if args.cmd == "paper-sim":
         return cmd_paper_sim(args)
+    if args.cmd == "monitor":
+        from .monitor import run_monitor
+        df, risk = load_hs300(Path(args.data))
+        return run_monitor(df, risk, FactorRegistry(Path(args.registry)), ROOT / "runs" / "monitor",
+                           apply=not args.dry_run)
+    if args.cmd == "daily-job":
+        from .daily_job import run_daily_job
+        r = run_daily_job(ROOT, Path(args.data), Path(args.registry), Path(args.out), force=args.force)
+        if r.get("outcome") == "skipped":
+            print(f"跳过：{r['note']}")
+        if r.get("outcome") == "failed":
+            raise SystemExit(1)
+        return r
+    if args.cmd == "schedule":
+        from . import schedule as sch
+        if args.action == "install":
+            r = sch.install(dry_run=args.dry_run)
+            if args.dry_run:
+                print(r["content"])
+            else:
+                print(f"已安装 {r['plist']}：{sch.describe(r['slots'])}（北京时间周一到周五 17:30、18:30、19:30）")
+        elif args.action == "uninstall":
+            r = sch.uninstall()
+            print("已卸载" if r["removed"] else "本来就没有安装")
+        else:
+            r = sch.status()
+            print(json.dumps(r, ensure_ascii=False, indent=2))
+        return r
+    if args.cmd == "factors" and (args.activate or args.deactivate):
+        reg = FactorRegistry(Path(args.registry))
+        x = reg.set_active(args.activate or args.deactivate, bool(args.activate), reason=args.reason or "人工操作")
+        print(f"{x['name']}：{'已启用' if x['active'] else '已停用'}")
+        return x
     if args.cmd == "factors":
         for x in FactorRegistry(Path(args.registry)).items(active_only=False):
             t = (x.get("test_metrics") or {}).get("test", {})
