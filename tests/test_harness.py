@@ -864,15 +864,17 @@ def test_report_inbox_scan_dedup_and_screen(tmp_path):
 
 
 def test_retrieval_modes(monkeypatch):
-    """默认字面检索（与改动前排序一致）；关掉向量模型时混合模式退回字面；混合模式下语义通道能召回换了说法的同一观点。"""
+    """默认混合检索，向量模型不可用时退回字面；字面模式与改动前排序一致；混合模式下语义通道能召回换了说法的同一观点。"""
     from qharness import retrieval as R
     from qharness.experience import similarity
 
     q = "过去20日收盘价与成交量相关性高的个股后续表现更好"
     texts = ["凝血因子产品快速放量", "收盘价与成交量的20日相关系数越高，个股未来收益越高", "短期动量延续"]
-    monkeypatch.delenv("QH_RETRIEVAL", raising=False)
+    monkeypatch.setenv("QH_RETRIEVAL", "lexical")
     assert R.mode() == "lexical"
     assert R.rank(q, texts) == sorted(range(3), key=lambda i: -similarity(q, texts[i]))
+    monkeypatch.delenv("QH_RETRIEVAL")
+    assert R.mode() == ("hybrid" if R.enabled() else "lexical")
     monkeypatch.setenv("QH_RETRIEVAL", "nonsense")
     with pytest.raises(ValueError):
         R.mode()

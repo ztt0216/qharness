@@ -4,8 +4,8 @@
 - 字面：数字和专有名词要靠它（「5 日反转」和「20 日反转」在语义向量里几乎一样）
 - 混合排序用 RRF（倒数排名融合），两种分数不在一个尺度上，按名次合并不需要换算
 - 模型没装或 QH_EMBED=off 时退回纯字面，流程照常跑
-- 默认用字面（QH_RETRIEVAL=lexical）：在本项目的运行记录上，字面检索的召回比语义和混合都好或持平（retrieval_eval.py）；
-  QH_RETRIEVAL=hybrid 打开混合检索。经验检索、论据核对固定用字面（要的就是字面一致，数字不能混）
+- 默认用混合（QH_RETRIEVAL=hybrid）：改写过措辞的查询上混合略好，原句查询上字面略好（retrieval_eval.py），
+  混合兼顾两种情况；QH_RETRIEVAL=lexical 切回纯字面。经验检索、论据核对固定用字面（要的就是字面一致，数字不能混）
 
 模型放在 data/models/（不纳入版本管理），首次使用时由 `python -m qharness.retrieval --download` 下载。
 """
@@ -36,8 +36,8 @@ SEMANTIC_SAME = 0.75
 
 
 def mode() -> str:
-    """研报检索方式（QH_RETRIEVAL）。默认字面：在本项目的运行记录上实测字面最好（见 README「检索」）。"""
-    m = os.environ.get("QH_RETRIEVAL", "lexical").lower()
+    """研报检索方式（QH_RETRIEVAL），默认混合；向量模型不可用时退回字面（见 README「检索」）。"""
+    m = os.environ.get("QH_RETRIEVAL", "hybrid").lower()
     if m not in MODES:
         raise ValueError(f"QH_RETRIEVAL 只能是 {'、'.join(MODES)}")
     return m if m == "lexical" or enabled() else "lexical"

@@ -224,7 +224,7 @@ baostock 并发太高会封 IP，东财接口会断连接，所以下载都是�
 
 - **结论**：在这个项目的数据上，语义向量没有带来提升。观点是从切片里抽出来的，措辞和原文接近；中文二元组对术语密集的研报已经很有效；检索都在一篇研报内部，候选只有二三十段；因子识别靠公式和窗口这类精确字眼，语义向量分不清「5 日反转」和「20 日反转」（相似度 0.88）。
 - **语义通道的代价**：同义改写的语义相似度实测 0.67~0.77，无关观点也常到 0.63~0.66。在一篇 47 条观点的研报上，阈值 0.7 会额外多 119 次模型确认（字面初筛才 47 次），0.8 只多 8 次但几乎召回不到改写，取 0.75（多 34 次）。
-- **所以**：默认用字面（`QH_RETRIEVAL=lexical`），`QH_RETRIEVAL=hybrid` 打开混合（端到端跑过示例研报，结论一致）；模型没下载或 `QH_EMBED=off` 时自动退回字面。经验检索和论据核对固定用字面：前者要分清数字，后者要的就是「论据逐字出自原文」，语义匹配会把改写甚至编造的论据也放过去。
+- **所以**：默认用混合（`QH_RETRIEVAL=hybrid`）。原句查询上它比字面略低（0.810 对 0.848），改写查询上略高（0.756 对 0.744），实际流程里两种查询都有（主题找正文、假设找定义的措辞和原文不同），混合兼顾；代价是观点归并会多一些模型确认（上面那篇研报多 34 次）。`QH_RETRIEVAL=lexical` 切回纯字面；模型没下载或 `QH_EMBED=off` 时自动退回字面。端到端跑过示例研报，结论和字面模式一致。经验检索和论据核对固定用字面：前者要分清数字，后者要的就是「论据逐字出自原文」，语义匹配会把改写甚至编造的论据也放过去。
 - 换更大的模型（bge-base、bge-m3）或加重排可能改善语义这一路，没有试。
 
 ### 自动找研报（`qharness reports`）
@@ -367,7 +367,7 @@ FastAPI（`qharness/web.py`）+ React（`web/`，Vite + TypeScript）。后端�
 | 方向由 Harness 施加 | `sandbox.with_direction`；实验层提示词不含 direction；只翻方向时跳过重新生成 | `test_direction_applied_by_harness`、`test_coder_does_not_see_direction` |
 | Qlib | `qlib_bridge.py`：数据转换、表达式白名单、和行情一致性检查、TopkDropout 回测复核 | `test_qlib_expression_matches_pandas`、`test_qlib_expression_static_rules`、`test_qlib_rejects_stale_data`、`test_qlib_backtest_runs`、`test_experiment_agent_uses_qlib_tool_real_model` |
 | Qlib 模型训练 | `qlib_model.py`：Alpha158 + 梯度提升树（LightGBM 不可用时 sklearn），Qlib workflow 记录，Harness 口径评估，测试段按配置加锁，调仓相位区间 | `test_qlib_model_train_alpha158`、`test_registry_exprs_keep_registered_direction` |
-| 检索 | `retrieval.py`：字面 / 语义 / 混合（RRF），默认按评测结果用字面；`retrieval_eval.py` 在运行记录上对比 | `test_retrieval_modes`、`qharness eval-retrieval` |
+| 检索 | `retrieval.py`：字面 / 语义 / 混合（RRF），默认混合，模型不可用时退回字面；`retrieval_eval.py` 在运行记录上对比 | `test_retrieval_modes`、`qharness eval-retrieval` |
 | 自动找研报 | `report_fetch.py`：标题筛选、下载校验、程序和模型两道预筛（程序复核模型结论）、状态落盘 | `test_report_fetch_title_filter`、`test_report_fetch_pipeline_offline`、`test_report_inbox_scan_dedup_and_screen`、`test_web_api_reports_joins_runs` |
 | 前端 | `web.py`：只读接口 + 白名单任务（研究运行、每日任务）；路径和上传校验；`web/` 的 React 页面 | `test_web_api_reads_runs_and_guards_paths` |
 | 滚动训练 | `qlib_model.folds` / `walk_forward`：扩张或固定窗口，训练 / 验证 / 预测间隔 embargo，逐折和整体样本外评估 | `test_walk_forward_folds_have_embargo`、`test_walk_forward_runs_and_locks_test` |
