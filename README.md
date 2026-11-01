@@ -93,8 +93,15 @@ QH_ENV_FILE=path/to/.env .venv/bin/python -m qharness serve
 | 流通市值、换手率 | 新浪不复权日线的收盘价 × 流通股本 | 换手率作为可选字段 `turnover` 开放给因子代码 |
 | 行业 | 巨潮资讯行业变更历史，申万一级；无申万记录时用新财富分类 | 按变更日期还原每天的行业 |
 | 涨跌停 | 不复权价与前收计算（主板 10%，创业板/科创板 20%） | ST 的 5% 未处理 |
+| 估值（每日） | baostock 日线的估值字段 | `pe_ttm`、`pb_mrq`、`ps_ttm`、`pcf_ttm`，覆盖率 100% |
+| 季报财务 | baostock 盈利能力、成长能力接口（带公告日） | `roe`、`np_margin`、`gp_margin`、`eps_ttm`、`net_profit`、`yoy_ni`、`yoy_equity`、`yoy_asset`、`yoy_pni`；**公告日之后第一个交易日生效**，同日两期取报告期新的，旧报告期的更正不回退；覆盖率 99.9%（毛利率 84.7%，银行等没有） |
 
 baostock 并发太高会封 IP，东财接口会断连接，所以下载都是串行加间隔。缓存里每个文件的 `source` 列标明来源。
+
+财务和估值：`python -m qharness.fundamentals` 下载（按股票分文件，可续传），之后每日任务自动追加估值、每周重下最近两个季度的财务。
+- 对齐的验证：浦发银行 2025-10-31（周五）公布三季报，ROE 从 11-03（下一个交易日）才变；测试覆盖了公告当天不可用、同日两期、旧报告期更正三种情况（`test_fundamentals_point_in_time`）。
+- 下载踩的坑：baostock 的收包循环是 `while True: recv()`，连接没有超时，一次卡了一个多小时。加了 socket 超时、断开重新登录重试、单只股票硬时限。另一个原因是这台 Mac 空闲 1 分钟就睡，下载只在维护唤醒的几十秒里推进，现在下载和定时任务都用 `caffeinate -i` 跑。
+- 局限：baostock 给的是最新口径，事后更正过的数据会覆盖原值；ROE、净利润是报告期累计值（一季度小、四季度大），财报季里已公布和未公布的股票混在一起比较会有噪声，单季或 TTM 口径还没有做。
 
 ## 流程
 
@@ -394,6 +401,7 @@ FastAPI（`qharness/web.py`）+ React（`web/`，Vite + TypeScript）。后端�
 | Qlib 模型训练 | `qlib_model.py`：Alpha158 + 梯度提升树（LightGBM 不可用时 sklearn），Qlib workflow 记录，Harness 口径评估，测试段按配置加锁，调仓相位区间 | `test_qlib_model_train_alpha158`、`test_registry_exprs_keep_registered_direction` |
 | 检索 | `retrieval.py`：字面 / 语义 / 混合（RRF），默认混合，模型不可用时退回字面；`retrieval_eval.py` 在运行记录上对比 | `test_retrieval_modes`、`qharness eval-retrieval` |
 | 自动找研报 | `report_fetch.py`：标题筛选、下载校验、程序和模型两道预筛（程序复核模型结论）、状态落盘 | `test_report_fetch_title_filter`、`test_report_fetch_pipeline_offline`、`test_report_inbox_scan_dedup_and_screen`、`test_web_api_reports_joins_runs` |
+| 财务数据（时点对齐） | `fundamentals.py`：公告日次日生效、同日两期、更正不回退；字段自动进入提示词和预筛 | `test_fundamentals_point_in_time`、`test_fundamental_fields_reach_factor_code_and_prompts`、`test_daily_job_fundamentals_failure_does_not_block` |
 | 前端 | `web.py`：只读接口 + 白名单任务（研究运行、每日任务）；路径和上传校验；`web/` 的 React 页面 | `test_web_api_reads_runs_and_guards_paths` |
 | 滚动训练 | `qlib_model.folds` / `walk_forward`：扩张或固定窗口，训练 / 验证 / 预测间隔 embargo，逐折和整体样本外评估 | `test_walk_forward_folds_have_embargo`、`test_walk_forward_runs_and_locks_test` |
 | 投入使用 | `daily_job.py`（幂等、按北京时间、失败续做）、`monitor.py`（衰减监控与自动停用）、`schedule.py`（launchd） | `test_daily_job_idempotent_and_resumes`、`test_monitor_deactivates_decayed_factor` |
@@ -411,6 +419,30 @@ QH_ENV_FILE=path/to/.env .venv/bin/python -m pytest -q
 ```
 
 第一条只跑确定性部分，在 `tests/fixtures` 的真实行情切片上跑，无需网络；切片用 `tests/fixtures/make_fixture.py` 从缓存生成。第二条加上调真实模型的测试，只断言流程约束，不断言模型的具体判断。研究层判断质量用 `eval-research` 单独打分。
+
+## 第一个登记因子：EP（市盈率倒数）
+
+接入财务和估值数据后，用三个经典财务因子跑完整流程（`run --hypothesis samples/hypotheses_fundamental.json`，6 次模型调用，32 秒）：
+
+| 因子 | 训练段 RankIC（t） | 验证段 RankIC（t） | 测试段 RankIC（t） | 结论 |
+|---|---|---|---|---|
+| EP（1 / pe_ttm） | +0.033（4.31） | +0.032（2.26） | +0.034（1.76） | 通过，登记 |
+| ROE | −0.009（−1.10） | +0.027（2.25） | — | 训练段弱且为负，淘汰 |
+| 净利润同比增速 | −0.002（−0.21） | +0.020（2.04） | — | 训练段无预测力，淘汰 |
+
+（RankIC 都是市值 + 行业中性化后的。）
+
+策略对照（测试段 2026-01-22 ~ 2026-10-22，年化超额）：
+
+| | 自有回测 | Qlib 回测（次日开盘、整手、费用） |
+|---|---|---|
+| 5 个基础因子 | −2.28% | −6.54%（IR −0.74） |
+| 基础因子 + EP | **+5.68%**（超额夏普 +0.65） | **+3.35%**（IR +0.39） |
+
+- 两个回测引擎方向一致，都提高约 8~10 个点；每次调仓换手从 1.00 降到 0.83（EP 换手很低）。
+- 衰减监控：最近 120 天 RankIC +0.033（t 1.31），正常。从下一个交易日起，每日任务会把 EP 纳入选股和模拟账户。
+- **要带着前提看**：EP 是众所周知的价值因子，不是新发现；测试段只有约 9 个月，t 1.76 在 5% 水平上不显著（登记规则只要求测试段 RankIC 为正、t 不为负）；这是单次切分的结果，模型那一节说明过单次切分可能很乐观。
+- 研究层诊断里有一处读错：它说「中性化前后差异巨大，alpha 主要来自市值 / 行业暴露」，但验证段中性化前 RankIC 只有 +0.001、中性化后 +0.032，正好相反：中性化之后信号才显出来。判定本身是规则做的，没有受影响；这类读数错误是研究层评测集要继续覆盖的。
 
 ## 研究层评测集结果（deepseek-v4-pro，关闭思考）
 
@@ -467,6 +499,7 @@ QH_ENV_FILE=path/to/.env .venv/bin/python -m pytest -q
 - PDF 解析针对「图表 N：标题 … 来源：」这种文字排版的券商研报；扫描件、图片里的表格、公式的上下标结构（只保留了拆行后的顺序）都没有处理。
 - 东方财富上公开的个股量价金工研报很少；日频可验证的研报需要自己提供 PDF。
 - `--llm openai` 路径尚未实测。
+- 财务数据只有盈利能力和成长能力两类季报指标 + 每日估值；资产负债表、现金流量表细项、分析师预期还没有。
 - 自动找研报只接了东方财富研报中心，公开的金工因子研报很少（见「自动找研报」）；需要登录的来源（慧博、萝卜投研、券商官网）不自动下载，用收件夹接入你自己下载的文件。
 - Qlib 接了数据、表达式计算、回测复核和模型训练（Alpha158 + 梯度提升树，用 Python 搭的 workflow，没有用 `qrun` 的 YAML 配置）；评估（中性化 RankIC、Newey-West、分段检验）仍是自己的实现。这台机器上 LightGBM 因缺 libomp 加载不了，实测用的是 sklearn 的同类模型。滚动训练的样本外只有 2.2 年、9 个季度，扣费后超额为负。自带 `--csv` 行情时不启用 Qlib。
 - 续跑时，中断那一刻正在执行的节点会重做一次（比如正在等模型返回的「生成代码」）；节点里写经验库的操作因此可能重复一次，经验库会把近似重复的记录合并。

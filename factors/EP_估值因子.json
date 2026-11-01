@@ -1,0 +1,122 @@
+{
+  "name": "EP 估值因子",
+  "code": "import pandas as pd\nimport numpy as np\n\ndef factor(df: pd.DataFrame) -> pd.Series:\n    \"\"\"\n    EP 估值因子：1 / pe_ttm（市盈率倒数，亏损股为负值）\n    \"\"\"\n    pe = df['pe_ttm']\n    # 市盈率为0或NaN时无法计算倒数，返回NaN\n    ep = 1.0 / pe.replace(0, np.nan)\n    return ep\n",
+  "hypothesis": {
+    "name": "EP 估值因子",
+    "fields": [
+      "pe_ttm"
+    ],
+    "calculation": "1 / pe_ttm（市盈率倒数，亏损股为负值）",
+    "window": 1,
+    "direction": 1,
+    "rationale": "估值低（盈利收益率高）的股票长期跑赢",
+    "condition": null
+  },
+  "metrics": {
+    "neutralized": true,
+    "train": {
+      "valid": true,
+      "n_days": 549,
+      "ic": 0.0251,
+      "rank_ic": 0.0333,
+      "icir": 0.3018,
+      "rank_icir": 0.359,
+      "rank_ic_t_nw": 4.31,
+      "rank_ic_positive_ratio": 0.6521,
+      "rank_ic_by_year": {
+        "2023": 0.0446,
+        "2024": 0.0273,
+        "2025": 0.0131
+      },
+      "rank_ic_raw": 0.068,
+      "group_returns": {
+        "G1": -0.00079,
+        "G2": 0.00042,
+        "G3": 0.00014,
+        "G4": 0.0018,
+        "G5": 0.00136
+      },
+      "long_short": 0.00215,
+      "group_monotonicity": 0.8,
+      "turnover": 0.0025,
+      "corr_with_library": {
+        "reversal_5d": 0.002,
+        "momentum_20d": -0.0149,
+        "low_vol_20d": 0.1283,
+        "illiquidity_20d": -0.0721,
+        "low_turnover_20d": 0.0306
+      },
+      "max_abs_corr_with_library": 0.1283
+    },
+    "valid": {
+      "valid": true,
+      "n_days": 179,
+      "ic": 0.0145,
+      "rank_ic": 0.0322,
+      "icir": 0.1537,
+      "rank_icir": 0.305,
+      "rank_ic_t_nw": 2.26,
+      "rank_ic_positive_ratio": 0.6034,
+      "rank_ic_by_year": {
+        "2025": 0.0307,
+        "2026": 0.0692
+      },
+      "rank_ic_raw": 0.0011,
+      "group_returns": {
+        "G1": 0.00772,
+        "G2": 0.00667,
+        "G3": 0.00531,
+        "G4": 0.00659,
+        "G5": 0.00909
+      },
+      "long_short": 0.00137,
+      "group_monotonicity": 0.1,
+      "turnover": 0.0017,
+      "corr_with_library": {
+        "reversal_5d": -0.0003,
+        "momentum_20d": -0.014,
+        "low_vol_20d": 0.195,
+        "illiquidity_20d": -0.0544,
+        "low_turnover_20d": 0.1077
+      },
+      "max_abs_corr_with_library": 0.195
+    }
+  },
+  "test_metrics": {
+    "test": {
+      "valid": true,
+      "n_days": 179,
+      "ic": 0.0237,
+      "rank_ic": 0.034,
+      "icir": 0.1912,
+      "rank_icir": 0.2561,
+      "rank_ic_t_nw": 1.76,
+      "rank_ic_positive_ratio": 0.6145,
+      "rank_ic_by_year": {
+        "2026": 0.034
+      },
+      "rank_ic_raw": 0.086,
+      "group_returns": {
+        "G1": -0.00822,
+        "G2": -0.00188,
+        "G3": -0.00314,
+        "G4": -0.00412,
+        "G5": -0.00383
+      },
+      "long_short": 0.00439,
+      "group_monotonicity": 0.1,
+      "turnover": 0.0025,
+      "corr_with_library": {
+        "reversal_5d": 0.0038,
+        "momentum_20d": -0.0178,
+        "low_vol_20d": 0.2688,
+        "illiquidity_20d": -0.044,
+        "low_turnover_20d": 0.1468
+      },
+      "max_abs_corr_with_library": 0.2688
+    }
+  },
+  "run_id": "20261101-130259-13c83d",
+  "registered_at": "2026-11-01 13:03:31",
+  "active": true
+}

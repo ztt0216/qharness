@@ -282,9 +282,10 @@ def main():
     p.add_argument("--start", default="2023-01-01", help="估值起始日；财务从起始日前两个季度开始（保证起始日有可用的最新季报）")
     p.add_argument("--end", default=time.strftime("%Y-%m-%d"))
     p.add_argument("--only", choices=["val", "fin"])
+    p.add_argument("--reverse", action="store_true", help="倒序处理股票（和另一个正序进程并行时用，各自从一头开始）")
     a = p.parse_args()
     cache = Path(a.cache)
-    codes = _codes(cache)
+    codes = _codes(cache)[::-1] if a.reverse else _codes(cache)
     print(f"{len(codes)} 只股票", flush=True)
     if a.only != "fin":
         print("估值：", download_valuation(cache, codes, a.start, a.end, log=lambda m: print(m, flush=True)), flush=True)

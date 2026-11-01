@@ -1,0 +1,8 @@
+[
+  {"name": "EP 估值因子", "fields": ["pe_ttm"], "calculation": "1 / pe_ttm（市盈率倒数，亏损股为负值）", "window": 1, "direction": 1,
+   "rationale": "估值低（盈利收益率高）的股票长期跑赢", "condition": null},
+  {"name": "ROE 盈利因子", "fields": ["roe"], "calculation": "roe（最新已公布报告期的净资产收益率）", "window": 1, "direction": 1,
+   "rationale": "盈利能力强的公司长期跑赢", "condition": null},
+  {"name": "净利润增速因子", "fields": ["yoy_ni"], "calculation": "yoy_ni（最新已公布报告期的净利润同比增速）", "window": 1, "direction": 1,
+   "rationale": "盈利增长快的公司后续跑赢", "condition": null}
+]
