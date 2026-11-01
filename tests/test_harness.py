@@ -1054,3 +1054,50 @@ def test_registered_factors_join_correlation_library(df):
     plain = Evaluator(df).evaluate(r.values * 1.5)["valid"]["max_abs_corr_with_library"]
     withreg = Evaluator(df, extra_library={"已登记": r.values}).evaluate(r.values * 1.5)["valid"]
     assert withreg["corr_with_library"]["已登记"] > 0.99 and withreg["max_abs_corr_with_library"] > plain
+
+
+def test_baostock_blocked_keeps_existing_data(tmp_path, monkeypatch):
+    """被拉黑时要报错停下，不能把每个季度记成"没有数据"，更不能覆盖已有的财务数据。"""
+    import sys
+    import types
+
+    from qharness.fundamentals import BaostockBlocked, download_fin
+
+    class RS:
+        def __init__(self, code="0", msg=""):
+            self.error_code, self.error_msg = code, msg
+
+    def fake(login):
+        return types.SimpleNamespace(login=lambda: login, logout=lambda: None,
+                                     query_profit_data=lambda **k: RS("10001011", "黑名单用户，请与管理员联系"),
+                                     query_growth_data=lambda **k: RS("10001011", "黑名单用户，请与管理员联系"))
+
+    d = tmp_path / "ref" / "fin"
+    d.mkdir(parents=True)
+    old = "year,quarter,pubDate,statDate,roe\n2026,2,2026-08-28,2026-06-30,0.03\n"
+    (d / "sh.600000.csv").write_text(old)
+    for login in (RS(), RS("10001011", "黑名单用户，请与管理员联系")):  # 查询时被拦、登录时被拦
+        monkeypatch.setitem(sys.modules, "baostock", fake(login))
+        with pytest.raises(BaostockBlocked):
+            download_fin(tmp_path, ["sh.600000"], [(2026, 2)], refresh_last=1)
+        assert (d / "sh.600000.csv").read_text() == old
+
+
+def test_stale_valuation_carried_forward_only_at_the_end(tmp_path):
+    """估值源断更：最新几天沿用最后一天（最多 5 天）；更早就断了的股票（退市）不补，历史上的缺口也不补。"""
+    from qharness.fundamentals import load_fundamentals
+
+    cal = pd.bdate_range("2026-01-01", periods=12)
+    panel = pd.DataFrame({"close": 1.0}, index=pd.MultiIndex.from_product(
+        [cal, ["SH600000", "SH600001"]], names=["datetime", "instrument"]))
+    d = tmp_path / "ref" / "val"
+    d.mkdir(parents=True)
+    cols = {"pb_mrq": 1, "ps_ttm": 1, "pcf_ttm": 1}
+    live = pd.DataFrame({"date": cal[:5], "pe_ttm": range(10, 15), **cols}).drop(index=2)  # 第 3 天有缺口
+    gone = pd.DataFrame({"date": cal[:3], "pe_ttm": [7.0, 7.0, 7.0], **cols})
+    live.to_csv(d / "sh.600000.csv", index=False)
+    gone.to_csv(d / "sh.600001.csv", index=False)
+    f = load_fundamentals(panel, tmp_path)["pe_ttm"].unstack("instrument")
+    assert np.isnan(f["SH600000"].iloc[2])
+    assert f["SH600000"].iloc[5:10].eq(14).all() and f["SH600000"].iloc[10:].isna().all()
+    assert f["SH600001"].iloc[3:].isna().all()

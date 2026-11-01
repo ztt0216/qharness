@@ -36,19 +36,37 @@ def _rows(rs) -> list[list[str]]:
     return out
 
 
+INDEXES = {"hs300": ("000300",), "csi800": ("000300", "000905")}  # 中证 800 = 沪深 300 + 中证 500
+_BS_QUERY = {"000300": "query_hs300_stocks", "000905": "query_zz500_stocks"}
+
+
+def meta(cache: Path = DEFAULT_CACHE) -> dict:
+    f = Path(cache) / "meta.txt"
+    d = dict(l.split("=", 1) for l in f.read_text(encoding="utf-8").split() if "=" in l) if f.exists() else {}
+    d.setdefault("index", "hs300")
+    return d
+
+
 def download_hs300(start: str, end: str, cache: Path = DEFAULT_CACHE, retries: int = 3,
-                  shard: int = 0, n_shards: int = 1) -> Path:
+                   shard: int = 0, n_shards: int = 1, index: str = "hs300") -> Path:
+    """index：hs300 或 csi800。股票池取起始日的成分（含之后调出、退市的），避免幸存者偏差。"""
+    import socket
+
     import baostock as bs
 
+    socket.setdefaulttimeout(20)  # baostock 的连接没有超时，断了会一直等
     cache.mkdir(parents=True, exist_ok=True)
     bs.login()
     try:
         uni_file = cache / "universe.csv"
         if not uni_file.exists():
-            uni = pd.DataFrame(_rows(bs.query_hs300_stocks(date=start)), columns=["updateDate", "code", "code_name"])
+            rows = []
+            for idx in INDEXES[index]:
+                rows += _rows(getattr(bs, _BS_QUERY[idx])(date=start))
+            uni = pd.DataFrame(rows, columns=["updateDate", "code", "code_name"]).drop_duplicates("code")
             uni.to_csv(uni_file, index=False)
         codes = pd.read_csv(uni_file)["code"].tolist()[shard::n_shards]
-        (cache / "meta.txt").write_text(f"start={start}\nend={end}\nadjustflag=1(后复权)\n", encoding="utf-8")
+        (cache / "meta.txt").write_text(f"start={start}\nend={end}\nadjustflag=1(后复权)\nindex={index}\n", encoding="utf-8")
         for i, code in enumerate(codes):
             f = cache / f"{code}.csv"
             if f.exists():
@@ -177,15 +195,19 @@ def download_cap(start: str, end: str, cache: Path = DEFAULT_CACHE, pause: float
 
 
 def current_constituents(cache: Path = DEFAULT_CACHE) -> list[str]:
-    """中证指数官网的最新沪深 300 成分，写到 universe_current.csv（每日持仓只在这里面选）。"""
+    """中证指数官网的最新成分（按 meta.txt 里的指数：沪深 300，或沪深 300 + 中证 500），
+    写到 universe_current.csv（每日持仓只在这里面选）。"""
     import akshare as ak
 
-    d = ak.index_stock_cons_csindex(symbol="000300")
-    ex = d["交易所"].map(lambda x: "sh" if "上海" in x else "sz")
-    codes = (ex + "." + d["成分券代码"].astype(str).str.zfill(6)).tolist()
-    pd.DataFrame({"code": codes, "name": d["成分券名称"], "date": d["日期"].astype(str)}).to_csv(
-        cache / "universe_current.csv", index=False)
-    return codes
+    frames = []
+    for idx in INDEXES[meta(cache)["index"]]:
+        d = ak.index_stock_cons_csindex(symbol=idx)
+        ex = d["交易所"].map(lambda x: "sh" if "上海" in x else "sz")
+        frames.append(pd.DataFrame({"code": ex + "." + d["成分券代码"].astype(str).str.zfill(6),
+                                    "name": d["成分券名称"], "date": d["日期"].astype(str)}))
+    out = pd.concat(frames, ignore_index=True).drop_duplicates("code")
+    out.to_csv(cache / "universe_current.csv", index=False)
+    return out["code"].tolist()
 
 
 def update(cache: Path = DEFAULT_CACHE, end: str | None = None, pause: float = 1.0, overlap: int = 10,
@@ -340,8 +362,11 @@ def main():
     p.add_argument("--workers", type=int, default=1, help="并行进程数（每个进程一个分片）；baostock 并发太高会封 IP")
     p.add_argument("--shard", type=int, default=None)
     p.add_argument("--source", choices=["baostock", "akshare", "industry", "cap"], default="baostock")
+    p.add_argument("--index", choices=list(INDEXES), default="hs300", help="股票池：hs300 或 csi800（沪深 300 + 中证 500）")
     p.add_argument("--update", action="store_true", help="每日增量更新（新浪），并刷新最新成分")
     a = p.parse_args()
+    import socket
+    socket.setdefaulttimeout(30)  # akshare（新浪、巨潮）和 baostock 的请求都不带超时，服务器不回就会一直等
     if a.update:
         print(update(Path(a.cache)))
         return
@@ -356,13 +381,13 @@ def main():
         print("无数据：", missing)
         return
     if a.shard is not None or a.workers == 1:
-        download_hs300(a.start, a.end, Path(a.cache), shard=a.shard or 0, n_shards=a.workers)
+        download_hs300(a.start, a.end, Path(a.cache), shard=a.shard or 0, n_shards=a.workers, index=a.index)
         return
-    download_hs300(a.start, a.end, Path(a.cache), n_shards=10**9)  # 只取股票池
+    download_hs300(a.start, a.end, Path(a.cache), n_shards=10**9, index=a.index)  # 只取股票池
     import subprocess
     import sys
     procs = [subprocess.Popen([sys.executable, "-m", "qharness.market", "--start", a.start, "--end", a.end,
-                               "--cache", a.cache, "--workers", str(a.workers), "--shard", str(i)])
+                               "--cache", a.cache, "--workers", str(a.workers), "--shard", str(i), "--index", a.index])
              for i in range(a.workers)]
     sys.exit(max(p.wait() for p in procs))
 

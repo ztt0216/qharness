@@ -32,6 +32,17 @@ def _rows(rs) -> list[list[str]]:
     return out
 
 
+STALE_VAL_DAYS = 5  # 估值断更时最多沿用几个交易日
+
+
+class BaostockBlocked(ConnectionError):
+    """登录失败或被拉黑。不能当成"这一期没有数据"：实测拉黑后查询照常返回，每只股票都会被记成空数据，日志还显示失败 0。"""
+
+
+def _blocked(msg: str) -> bool:
+    return "黑名单" in msg or "登录" in msg
+
+
 class _Session:
     """baostock 的连接没有超时：实测一次连接被对方重置后卡了一个多小时。这里设 socket 超时，
     超时或断开就重新登录再试，最多 retries 次。"""
@@ -51,18 +62,24 @@ class _Session:
         import io
 
         with contextlib.redirect_stdout(io.StringIO()):  # baostock 登录登出会打印，刷屏
-            self.bs.login()
+            rs = self.bs.login()
+        if rs.error_code != "0":
+            raise BaostockBlocked(f"baostock 登录失败：{rs.error_code} {rs.error_msg}")
 
     def call(self, fn: str, *args, **kw) -> list[list[str]]:
         last = None
         for attempt in range(self.retries):
             try:
                 rs = getattr(self.bs, fn)(*args, **kw)
+                if rs.error_code != "0" and _blocked(rs.error_msg):
+                    raise BaostockBlocked(f"{fn}：{rs.error_code} {rs.error_msg}")
                 if rs.error_code != "0" and "网络" not in rs.error_msg and "接收" not in rs.error_msg:
                     return []  # 业务错误（比如没有这一期）：不重试
                 if rs.error_code == "0":
                     return _rows(rs)
                 last = rs.error_msg
+            except BaostockBlocked:
+                raise
             except Exception as e:  # noqa: BLE001  超时、连接重置
                 last = f"{type(e).__name__}: {e}"
             time.sleep(1 + attempt)
@@ -152,6 +169,8 @@ def download_valuation(cache: Path, codes: list[str], start: str, end: str, log=
                 with _deadline(120):
                     rows = sess.call("query_history_k_data_plus", code, "date,peTTM,pbMRQ,psTTM,pcfNcfTTM", start_date=s,
                                      end_date=end, frequency="d", adjustflag="3")
+            except BaostockBlocked:
+                raise
             except (Exception, _StockTimeout) as e:  # noqa: BLE001
                 stats["failed"].append(code)
                 log(f"  {code} 估值下载失败：{type(e).__name__} {e}")
@@ -169,7 +188,8 @@ def download_valuation(cache: Path, codes: list[str], start: str, end: str, log=
     return stats
 
 
-def download_fin(cache: Path, codes: list[str], qs: list[tuple[int, int]], refresh_last: int = 0, log=print) -> dict:
+def download_fin(cache: Path, codes: list[str], qs: list[tuple[int, int]], refresh_last: int = 0, log=print,
+                 pause: float = 0.0) -> dict:
     """每只股票一个文件，记下已下载的季度；中断后再跑只补没下载的季度。refresh_last：最近几个季度强制重下（更新用）。"""
     d = cache / "ref" / "fin"
     d.mkdir(parents=True, exist_ok=True)
@@ -183,6 +203,8 @@ def download_fin(cache: Path, codes: list[str], qs: list[tuple[int, int]], refre
             have = set(zip(old["year"], old["quarter"])) if not old.empty else set()
             todo = [q for q in qs if q not in have or q in redo]
             rows = []
+            if todo and pause:
+                time.sleep(pause)
             try:
                 with _deadline(180):
                     for y, q in todo:
@@ -199,6 +221,8 @@ def download_fin(cache: Path, codes: list[str], qs: list[tuple[int, int]], refre
                             rec.update(pubDate=rec["pubDate"] or r[1], statDate=rec["statDate"] or r[2],
                                        yoy_equity=r[3], yoy_asset=r[4], yoy_ni=r[5], yoy_pni=r[7])
                         rows.append(rec)  # 没有数据的季度也记一行（pubDate 为空），下次不再重复请求
+            except BaostockBlocked:
+                raise
             except (Exception, _StockTimeout) as e:  # noqa: BLE001  已下载的季度照样保存，下次只补没下载的
                 stats["failed"].append(code)
                 log(f"  {code} 财务下载中断：{type(e).__name__} {e}（已保存 {len(rows)} 个季度）")
@@ -228,13 +252,23 @@ def load_fundamentals(panel: pd.DataFrame, cache: Path = DEFAULT_CACHE) -> pd.Da
         return None
     cal = panel.index.get_level_values("datetime").unique().sort_values()
     insts = panel.index.get_level_values("instrument").unique()
-    out = {}
+    out, val_last = {}, {}
     for f in sorted(vdir.glob("*.csv")) if vdir.exists() else []:
         inst = _inst(f.stem)
         if inst not in insts:
             continue
-        v = pd.read_csv(f, parse_dates=["date"]).set_index("date").reindex(cal)
-        out[inst] = v[VAL_FIELDS].apply(pd.to_numeric, errors="coerce")
+        raw = pd.read_csv(f, parse_dates=["date"]).set_index("date")
+        if not raw.empty:
+            val_last[inst] = raw.index.max()
+        out[inst] = raw.reindex(cal)[VAL_FIELDS].apply(pd.to_numeric, errors="coerce")
+    if val_last:  # 估值源断更（行情还在更新）时沿用最后一天，不然估值因子最新一天全空，会从合成里悄悄消失
+        newest = max(val_last.values())
+        stale = cal[cal > newest][:STALE_VAL_DAYS]
+        if len(stale) and newest in cal:
+            print(f"注意：估值数据只到 {newest.date()}，{len(stale)} 个交易日沿用这一天的值")
+            for inst, d in val_last.items():
+                if d == newest:  # 更早就断了的（退市、停牌）不补
+                    out[inst].loc[stale] = out[inst].loc[newest].to_numpy()
     for f in sorted(fdir.glob("*.csv")) if fdir.exists() else []:
         inst = _inst(f.stem)
         if inst not in insts:
@@ -266,11 +300,14 @@ def update(cache: Path = DEFAULT_CACHE, end: str | None = None, fin_refresh_days
     end = end or time.strftime("%Y-%m-%d")
     if not (cache / "ref" / "val").exists():
         return {"skipped": "还没有下载过财务和估值数据（python -m qharness.fundamentals --download）"}
+    from .market import meta
+
     codes = _codes(cache)
-    res = {"valuation": download_valuation(cache, codes, "2023-01-01", end, log=log)}
+    start = meta(cache).get("start", "2023-01-01")  # 估值和财务的起点跟着行情缓存走
+    res = {"valuation": download_valuation(cache, codes, start, end, log=log)}
     stamp = cache / "ref" / "fin" / ".refreshed"
     if not stamp.exists() or time.time() - stamp.stat().st_mtime > fin_refresh_days * 86400:
-        qs = quarters("2022-07-01", end)
+        qs = quarters(str((pd.Timestamp(start) - pd.DateOffset(months=6)).date()), end)
         res["fin"] = download_fin(cache, codes, qs, refresh_last=2, log=log)
         stamp.touch()
     return res
@@ -282,6 +319,7 @@ def main():
     p.add_argument("--start", default="2023-01-01", help="估值起始日；财务从起始日前两个季度开始（保证起始日有可用的最新季报）")
     p.add_argument("--end", default=time.strftime("%Y-%m-%d"))
     p.add_argument("--only", choices=["val", "fin"])
+    p.add_argument("--pause", type=float, default=0.0, help="财务每只股票之间停几秒（请求太多会被 baostock 拉黑）")
     p.add_argument("--reverse", action="store_true", help="倒序处理股票（和另一个正序进程并行时用，各自从一头开始）")
     a = p.parse_args()
     cache = Path(a.cache)
@@ -292,7 +330,7 @@ def main():
     if a.only != "val":
         qs = quarters(str((pd.Timestamp(a.start) - pd.DateOffset(months=6)).date()), a.end)
         print(f"财务：{qs[0][0]}Q{qs[0][1]} ~ {qs[-1][0]}Q{qs[-1][1]}，{len(qs)} 个季度", flush=True)
-        print("财务：", download_fin(cache, codes, qs, log=lambda m: print(m, flush=True)), flush=True)
+        print("财务：", download_fin(cache, codes, qs, log=lambda m: print(m, flush=True), pause=a.pause), flush=True)
 
 
 if __name__ == "__main__":
