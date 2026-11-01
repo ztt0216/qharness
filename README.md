@@ -401,6 +401,8 @@ FastAPI（`qharness/web.py`）+ React（`web/`，Vite + TypeScript）。后端�
 | Qlib 模型训练 | `qlib_model.py`：Alpha158 + 梯度提升树（LightGBM 不可用时 sklearn），Qlib workflow 记录，Harness 口径评估，测试段按配置加锁，调仓相位区间 | `test_qlib_model_train_alpha158`、`test_registry_exprs_keep_registered_direction` |
 | 检索 | `retrieval.py`：字面 / 语义 / 混合（RRF），默认混合，模型不可用时退回字面；`retrieval_eval.py` 在运行记录上对比 | `test_retrieval_modes`、`qharness eval-retrieval` |
 | 自动找研报 | `report_fetch.py`：标题筛选、下载校验、程序和模型两道预筛（程序复核模型结论）、状态落盘 | `test_report_fetch_title_filter`、`test_report_fetch_pipeline_offline`、`test_report_inbox_scan_dedup_and_screen`、`test_web_api_reports_joins_runs` |
+| 测试段锁（跨运行、按值认身份） | `Evaluator._value_keys`：测试段截面分位数 + 数据范围；全局 `runs/test_opened.txt` | `test_test_lock_by_values_blocks_transforms_and_flips` |
+| 相关性含已登记因子 | `Evaluator(extra_library=...)` | `test_registered_factors_join_correlation_library` |
 | 财务数据（时点对齐） | `fundamentals.py`：公告日次日生效、同日两期、更正不回退；字段自动进入提示词和预筛 | `test_fundamentals_point_in_time`、`test_fundamental_fields_reach_factor_code_and_prompts`、`test_daily_job_fundamentals_failure_does_not_block` |
 | 前端 | `web.py`：只读接口 + 白名单任务（研究运行、每日任务）；路径和上传校验；`web/` 的 React 页面 | `test_web_api_reads_runs_and_guards_paths` |
 | 滚动训练 | `qlib_model.folds` / `walk_forward`：扩张或固定窗口，训练 / 验证 / 预测间隔 embargo，逐折和整体样本外评估 | `test_walk_forward_folds_have_embargo`、`test_walk_forward_runs_and_locks_test` |
@@ -443,6 +445,32 @@ QH_ENV_FILE=path/to/.env .venv/bin/python -m pytest -q
 - 衰减监控：最近 120 天 RankIC +0.033（t 1.31），正常。从下一个交易日起，每日任务会把 EP 纳入选股和模拟账户。
 - **要带着前提看**：EP 是众所周知的价值因子，不是新发现；测试段只有约 9 个月，t 1.76 在 5% 水平上不显著（登记规则只要求测试段 RankIC 为正、t 不为负）；这是单次切分的结果，模型那一节说明过单次切分可能很乐观。
 - 研究层诊断里有一处读错：它说「中性化前后差异巨大，alpha 主要来自市值 / 行业暴露」，但验证段中性化前 RankIC 只有 +0.001、中性化后 +0.032，正好相反：中性化之后信号才显出来。判定本身是规则做的，没有受影响；这类读数错误是研究层评测集要继续覆盖的。
+
+### 继续提升效果的尝试（2026-11-01）
+
+先补了两处研究纪律的漏洞，再在现有数据上找提升：
+
+- **测试段锁跨运行、按因子值认身份**：原来每次运行一个锁文件、按代码文本认，新开一次运行或改个空格，同一个因子就能再看一次测试段；要继续多试因子，这就成了在测试段上挑结果。现在用全局 `runs/test_opened.txt`，按测试段的截面分位数（`(名次 − 0.5) / n`，对单调变换不变，取反后正好是 1 − 原值，一起锁）加数据范围认。2×EP+1、−EP 都会被拦下；扩大股票池后数据范围不同，算新的测试。
+- **相关性比较带上已登记因子**：原来只和 5 个基础因子比，和已登记的 EP 高度相关的候选也能过「相关不超过 0.7」。
+- **另外 4 个经典财务因子**（`samples/hypotheses_fundamental2.json`）全部淘汰：
+
+  | 因子 | 训练段 RankIC（t） | 验证段 RankIC（t） | 原因 |
+  |---|---|---|---|
+  | BP（1 / PB） | +0.046（5.44） | +0.007（0.48） | 训练段强，但逐年衰减，2025 年转负 |
+  | SP（1 / PS） | +0.031（3.81） | +0.019（1.60） | 验证段不显著；研究层改了一轮仍不显著 |
+  | CFP（1 / PCF） | +0.003（0.77） | +0.017（2.21） | 训练段无预测力 |
+  | ROE TTM（PB / PE） | −0.008（−1.04） | +0.018（1.50） | 训练段为负 |
+
+  BP 和 EP 中性化后相关只有 0.40，是因为弱被淘汰、不是重复。价值风格 2023~2024 有效、2025 转弱，这段样本里只有 EP 三段都站得住。
+- **组合规则**：5 个基础因子里低波动、非流动性、低换手训练段显著（t 3~5.7），验证段全部转负。预先写定一条规则（训练段和验证段 RankIC 都为正才进组合，等权），测试段只比一次：
+
+  | 组合 | 自有回测 | 5 个调仓起点 | Qlib 复核 |
+  |---|---|---|---|
+  | 现在：5 个基础因子 + EP 等权 | +5.68% | +4.6% ~ +11.2% | +3.35%（IR +0.39） |
+  | 规则：两段同为正（5 日反转 + EP） | −18.18% | −25.7% ~ −3.2% | −22.90%（IR −2.55） |
+
+  规则组合差得多：5 日反转换手高（每次调仓 1.49 对 0.83），被剔掉的低波动、低换手在 2026 年测试段又恢复了（衰减监控：低波动最近 120 天 RankIC +0.061）。只按验证段选因子等于追最近的风格，分散持有反而扛住了风格来回切换。组合保持不变，也不再换别的规则去试（否则就是在测试段上挑结果）。
+- **结论**：在沪深 300、不到 4 年的数据上，能挤的已经挤得差不多了。再往上主要靠扩大样本（更多股票、更长历史），见「已知局限」。
 
 ## 研究层评测集结果（deepseek-v4-pro，关闭思考）
 

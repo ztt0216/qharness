@@ -1,0 +1,10 @@
+[
+  {"name": "BP 估值因子", "fields": ["pb_mrq"], "calculation": "1 / pb_mrq（市净率倒数）", "window": 1, "direction": 1,
+   "rationale": "市净率低的股票长期跑赢", "condition": null},
+  {"name": "SP 估值因子", "fields": ["ps_ttm"], "calculation": "1 / ps_ttm（市销率倒数）", "window": 1, "direction": 1,
+   "rationale": "市销率低的股票长期跑赢", "condition": null},
+  {"name": "CFP 估值因子", "fields": ["pcf_ttm"], "calculation": "1 / pcf_ttm（市现率倒数，经营现金流为负时为负值）", "window": 1, "direction": 1,
+   "rationale": "经营现金流相对市值高的股票跑赢", "condition": null},
+  {"name": "ROE TTM", "fields": ["pb_mrq", "pe_ttm"], "calculation": "pb_mrq / pe_ttm（= 近 12 个月净利润 / 最新净资产，避开报告期累计值的季节性）", "window": 1, "direction": 1,
+   "rationale": "盈利能力强的公司长期跑赢", "condition": null}
+]
