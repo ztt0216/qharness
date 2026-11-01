@@ -1101,3 +1101,21 @@ def test_stale_valuation_carried_forward_only_at_the_end(tmp_path):
     assert np.isnan(f["SH600000"].iloc[2])
     assert f["SH600000"].iloc[5:10].eq(14).all() and f["SH600000"].iloc[10:].isna().all()
     assert f["SH600001"].iloc[3:].isna().all()
+
+
+def test_agent_stats_counts_each_implementation(tmp_path):
+    """没有 cand 字段时，同一次运行里 fix=0 的两次执行是两次实现，不能合并。"""
+    import json
+
+    from qharness.agent_stats import collect
+
+    d = tmp_path / "r1"
+    d.mkdir()
+    ev = [{"node": "experiment.execute", "round": 0, "fix": 0, "ok": False, "error_type": "RUNTIME"},
+          {"node": "experiment.execute", "round": 0, "fix": 1, "ok": True},
+          {"node": "experiment.execute", "round": 0, "fix": 0, "ok": True},
+          {"node": "experiment.execute", "round": 0, "fix": 0, "ok": False, "error_type": "RUNTIME"},
+          {"node": "experiment.give_up", "error_type": "RUNTIME"}]
+    (d / "trace.jsonl").write_text("\n".join(json.dumps(e) for e in ev))
+    c = collect(tmp_path)["coding"]
+    assert (c["rounds"], c["first_pass"], c["final_ok"], c["needed_fix"], c["fixed"]) == (3, 1, 2, 2, 1)

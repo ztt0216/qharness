@@ -427,6 +427,7 @@ def main(argv=None):
     rp.add_argument("--no-screen", action="store_true", help="fetch：不调用模型预筛")
     rp.add_argument("--llm", choices=["anthropic", "openai"], default="anthropic")
     rp.add_argument("--env-file")
+    sub.add_parser("agent-stats", help="从运行记录统计 Agent 指标：编码首次通过率、修复、经验命中、token 和延迟")
     er = sub.add_parser("eval-retrieval", help="检索评测：字面 / 语义 / 混合在真实运行记录上的对比")
     er.add_argument("--no-llm", action="store_true", help="不跑改写查询那组（要调用模型）")
     er.add_argument("--out", default=str(ROOT / "runs" / "retrieval_eval.json"))
@@ -515,6 +516,10 @@ def main(argv=None):
 
     if args.cmd == "qlib-dump":
         return cmd_qlib_dump(Path(args.data), Path(args.out))
+    if args.cmd == "agent-stats":
+        from .agent_stats import write
+        print(json.dumps(write(ROOT / "runs"), ensure_ascii=False, indent=2))
+        return
     if args.cmd == "eval-retrieval":
         from .retrieval_eval import run as eval_retrieval
         res = eval_retrieval(ROOT / "runs", Path(args.out), None if args.no_llm else make_llm("anthropic"))
