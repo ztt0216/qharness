@@ -86,11 +86,22 @@ def backtest(df: pd.DataFrame, score: pd.DataFrame, dates: pd.DatetimeIndex, top
             "n_days": int(len(excess))}
 
 
+def validation_backtest(ev: Evaluator, values: pd.Series, topk: int = 20, rebalance: int = 5) -> dict:
+    """研究层回测工具的实现：验证段上用 Qlib 回测，对比基线和基线 + 候选因子。不碰测试段。"""
+    from . import qlib_bridge as qb
+
+    dates = segment_dates(ev.df, ev.split.valid)
+    lib = list(ev.raw_library.values()) + list(ev.raw_extra.values())
+    return {"segment": f"{dates[0].date()} ~ {dates[-1].date()}", "topk": topk, "rebalance": rebalance,
+            "baseline": qb.qlib_backtest(combine(ev, lib), dates[0], dates[-1], topk, rebalance=rebalance),
+            "with_factor": qb.qlib_backtest(combine(ev, lib + [values]), dates[0], dates[-1], topk, rebalance=rebalance)}
+
+
 def validate_strategy(ev: Evaluator, new_factors: dict[str, pd.Series], topk: int = 20,
-                      registered: dict[str, pd.Series] | None = None) -> dict:
-    """基线 = 因子库 + 已登记因子；对比加入本次通过的新因子后的效果（测试段）。"""
+                      registered: dict[str, pd.Series] | None = None, dates=None) -> dict:
+    """基线 = 因子库 + 已登记因子；对比加入本次通过的新因子后的效果（默认测试段，dates 可指定区间）。"""
     lib = list(ev.raw_library.values()) + list((registered or {}).values())
-    test_dates = segment_dates(ev.df, ev.split.test)
+    test_dates = dates if dates is not None else segment_dates(ev.df, ev.split.test)
     base = backtest(ev.df, combine(ev, lib), test_dates, topk, risk=ev.risk)
     out = {"segment": f"{test_dates[0].date()} ~ {test_dates[-1].date()}", "baseline": base,
            "baseline_factors": list(ev.raw_library) + list(registered or {})}

@@ -89,6 +89,7 @@ class Evaluator:
         self.risk = risk
         self.neutralized = risk is not None
         self.raw_library = baseline_library(self.df, risk)
+        self.raw_extra = extra_library or {}
         # 相关性比较的因子库：基础因子 + 已登记因子（extra_library）。不加登记因子的话，和已登记的 EP 高度相关的 BP
         # 也能过「和因子库相关不超过 0.7」这一关，组合会在价值上重复加仓
         self.library = {k: self._prep(v) for k, v in {**self.raw_library, **(extra_library or {})}.items()}

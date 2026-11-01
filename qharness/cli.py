@@ -427,6 +427,10 @@ def main(argv=None):
     rp.add_argument("--no-screen", action="store_true", help="fetch：不调用模型预筛")
     rp.add_argument("--llm", choices=["anthropic", "openai"], default="anthropic")
     rp.add_argument("--env-file")
+    sc6 = sub.add_parser("strategy-compare", help="已登记因子加入前后的策略对比：取最近若干个月（默认 6 个月）")
+    sc6.add_argument("--data", default=str(DEFAULT_CACHE))
+    sc6.add_argument("--registry", default="factors")
+    sc6.add_argument("--months", type=int, default=6)
     sub.add_parser("agent-stats", help="从运行记录统计 Agent 指标：编码首次通过率、修复、经验命中、token 和延迟")
     er = sub.add_parser("eval-retrieval", help="检索评测：字面 / 语义 / 混合在真实运行记录上的对比")
     er.add_argument("--no-llm", action="store_true", help="不跑改写查询那组（要调用模型）")
@@ -516,6 +520,21 @@ def main(argv=None):
 
     if args.cmd == "qlib-dump":
         return cmd_qlib_dump(Path(args.data), Path(args.out))
+    if args.cmd == "strategy-compare":
+        import pandas as pd
+
+        from .strategy import segment_dates, validate_strategy
+        df, risk = load_hs300(Path(args.data))
+        ev = Evaluator(df, risk=risk)
+        factors = FactorRegistry(Path(args.registry)).compute(df)
+        all_d = segment_dates(df, ev.split.test)
+        dates = all_d[all_d > all_d[-1] - pd.DateOffset(months=args.months)]
+        res = validate_strategy(ev, factors, dates=dates)
+        res["note"] = "落在已经打开过的测试段内，是同一段数据的子区间，不是新的独立证据"
+        out = ROOT / "runs" / f"strategy_{args.months}m.json"
+        out.write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return res
     if args.cmd == "agent-stats":
         from .agent_stats import write
         print(json.dumps(write(ROOT / "runs"), ensure_ascii=False, indent=2))

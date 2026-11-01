@@ -940,19 +940,31 @@ def test_daily_job_idempotent_and_resumes(tmp_path):
         if daily["fail"]:
             raise RuntimeError("撮合出错")
         return {"nav": 1.0}
+
+    def broken_monitor():
+        calls.append("monitor")
+        raise RuntimeError("监控出错")
     steps = {"update": update, "monitor": lambda: calls.append("monitor") or {"deactivated": []}, "daily": run_daily}
     job = lambda h, d="2026-11-02": run_daily_job(tmp_path, cache, tmp_path / "f", tmp_path / "p", steps=steps,  # noqa: E731
                                                  now=datetime.fromisoformat(f"{d}T{h}").replace(tzinfo=BEIJING))
     assert job("18:00", "2026-10-31")["note"] == "周末" and job("15:00")["outcome"] == "skipped" and not calls
     assert job("17:30")["outcome"] == "no_new_data" and calls == ["update"]           # 数据源还没发布
-    update.publish, daily["fail"] = "2026-11-02", True
-    assert job("18:30")["outcome"] == "failed" and calls[-3:] == ["update", "monitor", "daily"]
-    daily["fail"], calls[:] = False, []
+    update.publish, steps["monitor"] = "2026-11-02", broken_monitor
+    assert job("18:30")["outcome"] == "failed" and calls[-2:] == ["update", "monitor"]
+    steps["monitor"], calls[:] = lambda: calls.append("monitor") or {"deactivated": []}, []
     r = job("19:30")
-    assert r["outcome"] == "done" and calls == ["monitor", "daily"]                   # 行情已更新：不重复更新
+    assert r["outcome"] == "done" and calls == ["monitor"]                            # 行情已更新：不重复更新
     calls.clear()
     assert job("20:30")["outcome"] == "skipped" and not calls                         # 当天已处理：不联网
     assert [h["outcome"] for h in history(tmp_path / "runs")] == ["no_new_data", "failed", "done"]
+    # 盘前：用最新收盘数据算组合和挂单，只做一次；失败下次再试；开盘后不补算
+    assert job("09:40", "2026-11-03")["outcome"] == "skipped" and not calls
+    daily["fail"] = True
+    assert job("08:30", "2026-11-03")["outcome"] == "failed" and calls == ["daily"]
+    daily["fail"], calls[:] = False, []
+    assert job("09:00", "2026-11-03")["outcome"] == "done" and calls == ["daily"]
+    calls.clear()
+    assert job("09:10", "2026-11-03")["outcome"] == "skipped" and not calls
 
 
 def test_daily_job_time_limit(tmp_path):
@@ -1033,7 +1045,7 @@ def test_daily_job_fundamentals_failure_does_not_block(tmp_path):
     steps = {"update": update, "fundamentals": fundamentals, "monitor": lambda: {}, "daily": lambda: None}
     r = run_daily_job(tmp_path, cache, tmp_path / "f", tmp_path / "p", steps=steps,
                       now=datetime(2026, 11, 2, 18, 0, tzinfo=BEIJING))
-    assert r["outcome"] == "done" and r["steps"] == ["update", "monitor", "daily"] and "baostock 断开" in r["warnings"][0]
+    assert r["outcome"] == "done" and r["steps"] == ["update", "monitor"] and "baostock 断开" in r["warnings"][0]
 
 
 def test_test_lock_by_values_blocks_transforms_and_flips(df, tmp_path):
@@ -1119,3 +1131,37 @@ def test_agent_stats_counts_each_implementation(tmp_path):
     (d / "trace.jsonl").write_text("\n".join(json.dumps(e) for e in ev))
     c = collect(tmp_path)["coding"]
     assert (c["rounds"], c["first_pass"], c["final_ok"], c["needed_fix"], c["fixed"]) == (3, 1, 2, 2, 1)
+
+
+def test_research_designs_validation_backtest():
+    """研究层自己选回测参数并调用工具；参数被限制在范围内；只有方向对的候选才回测；回测不改变规则判定。"""
+    class LLM:
+        def __init__(self):
+            self.n = 0
+
+        def respond(self, role, system, messages, tools, context):
+            self.n += 1
+            if self.n == 1:
+                return [{"type": "tool_use", "id": "a", "name": "run_qlib_backtest", "input": {"topk": 500, "rebalance": 10}}]
+            return [{"type": "text", "text": "结论"}]
+
+        def chat(self, role, messages, context):
+            assert "验证段策略回测" in messages[-1]["content"]
+            return "{}"
+
+    seg = {"valid": True, "n_days": 200, "rank_ic": 0.03, "rank_ic_t_nw": 3.0, "rank_ic_positive_ratio": 0.6,
+           "rank_ic_by_year": {"2025": 0.03}, "rank_ic_raw": 0.03, "group_returns": {"G1": 0.0, "G5": 0.001},
+           "long_short": 0.001, "group_monotonicity": 0.8, "turnover": 0.1, "corr_with_library": {},
+           "max_abs_corr_with_library": 0.1, "ic": 0.03, "rank_icir": 0.3}
+    calls = []
+
+    def runner(topk, rebalance):
+        calls.append((topk, rebalance))
+        return {"topk": topk, "with_factor": {"annual_excess": 0.1}}
+    h = {"name": "x", "fields": ["close"], "calculation": "close", "window": 1, "direction": 1}
+    agent = ResearchAgent(LLM())
+    v = agent.judge(h, {"neutralized": False, "train": seg, "valid": seg}, can_refine=False, backtest=runner)
+    assert calls == [(50, 10)] and v.rule_details["backtests"][0]["topk"] == 50
+    assert v.verdict == ("accept" if v.rule_details["passed"] else "reject")
+    neg = {**seg, "rank_ic": -0.03}
+    assert ResearchAgent(LLM()).design_backtests(h, {"train": seg, "valid": neg}, runner) == [] and len(calls) == 1

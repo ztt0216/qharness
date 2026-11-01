@@ -1,6 +1,7 @@
 """每日任务（`qharness daily-job`）：更新行情 → 更新财务和估值 → 因子衰减监控 → 每日持仓和模拟账户结算，给定时任务调用。
 
-- 按北京时间判断：周末不跑；收盘前（16:00 前）不跑
+- 同一个命令按北京时间分两段：16:00 之后「收盘后」更新行情 → 财务和估值 → 因子衰减监控；09:30 之前「盘前」结算 → 算目标组合 → 挂单（当天开盘撮合）
+- 周末不跑；09:30 到 16:00 不跑（错过盘前窗口就等下一个交易日，不在开盘后补算）
 - 幂等：当天已经处理完就直接退出（不联网），所以一晚上可以安排多次，先到先做
 - 数据源还没发布当天行情（或节假日）：记为 no_new_data，等下一次
 - 行情更新了但后面的步骤没跑完（比如中途崩溃）：下一次从监控接着做，不重复更新
@@ -52,7 +53,13 @@ def history(runs: Path, n: int = 30) -> list[dict]:
 
 
 def _done(runs: Path, d: date) -> bool:
-    return any(r.get("date") == str(d) and r.get("outcome") == "done" for r in history(runs, 200))
+    return any(r.get("date") == str(d) and r.get("outcome") == "done" and r.get("kind") != "premarket"
+               for r in history(runs, 200))
+
+
+def _premarket_done(runs: Path, d: date) -> bool:
+    return any(r.get("date") == str(d) and r.get("outcome") == "done" and r.get("kind") == "premarket"
+               for r in history(runs, 200))
 
 
 class JobTimeout(Exception):
@@ -61,7 +68,7 @@ class JobTimeout(Exception):
 
 def run_daily_job(root: Path, cache: Path, registry: Path, portfolio: Path, force: bool = False,
                   now: datetime | None = None, steps: dict | None = None, max_seconds: int = 7200) -> dict:
-    """steps 可替换各步（测试用）：update(cache) -> stats、monitor()、daily() -> nav。
+    """steps 可替换各步（测试用）：update(cache) -> stats、monitor()；盘前 daily() -> nav。
     max_seconds：整个任务的时限（默认 2 小时），超时记为失败退出，不挡住之后的定时触发
     （launchd 在上一次还没结束时不会启动新的一次）。正常一次全量更新约 7 秒一只、380 只约 45 分钟。"""
     import signal
@@ -81,11 +88,7 @@ def run_daily_job(root: Path, cache: Path, registry: Path, portfolio: Path, forc
             signal.signal(signal.SIGALRM, old)
 
 
-def _run(root: Path, cache: Path, registry: Path, portfolio: Path, force: bool, now: datetime | None,
-         steps: dict | None) -> dict:
-    runs = root / "runs"
-    now = now or beijing_now()
-    rec = {"started": time.strftime("%Y-%m-%d %H:%M:%S"), "beijing": now.strftime("%Y-%m-%d %H:%M"), "steps": []}
+def _recorder(runs: Path, now: datetime, rec: dict):
     logf = runs / "daily" / f"{now.date()}.log"
     _status_log(runs)
 
@@ -102,11 +105,51 @@ def _run(root: Path, cache: Path, registry: Path, portfolio: Path, force: bool, 
         log(f"结束：{outcome}" + (f"（{kw.get('note')}）" if kw.get("note") else ""))
         return rec
 
+    return log, finish
+
+
+def _premarket(root: Path, cache: Path, registry: Path, portfolio: Path, force: bool, now: datetime,
+               steps: dict) -> dict:
+    """盘前：结算上次挂单、用最新收盘数据算目标组合、挂单（当天开盘撮合）。只用前一交易日及以前的数据。"""
+    runs = root / "runs"
+    rec = {"kind": "premarket", "started": time.strftime("%Y-%m-%d %H:%M:%S"), "beijing": now.strftime("%Y-%m-%d %H:%M"),
+           "steps": []}
+    log, finish = _recorder(runs, now, rec)
+    last = cache_last_date(cache)
+    if not force and last is not None and _premarket_done(runs, last):
+        return {"outcome": "skipped", "note": f"{last} 的数据已经算过盘前组合"}
+    log(f"盘前：北京时间 {rec['beijing']}，行情缓存最新 {last}")
+    try:
+        if "daily" in steps:
+            nav = steps["daily"]()
+        else:
+            from .cli import cmd_daily
+            ns = argparse.Namespace(data=str(cache), registry=str(registry), topk=20, out=str(portfolio),
+                                    paper=str(portfolio / "account.json"), capital=1_000_000, rebalance=5)
+            cmd_daily(ns)
+            acct = json.loads((portfolio / "account.json").read_text(encoding="utf-8"))
+            nav = acct["nav"][-1] if acct.get("nav") else None
+        rec["steps"].append("daily")
+        return finish("done", date=str(last), nav=nav)
+    except (Exception, JobTimeout) as e:  # noqa: BLE001  记下来，下一次定时会再试
+        log(traceback.format_exc())
+        return finish("failed", date=str(last), error=f"{type(e).__name__}: {e}")
+
+
+def _run(root: Path, cache: Path, registry: Path, portfolio: Path, force: bool, now: datetime | None,
+         steps: dict | None) -> dict:
+    runs = root / "runs"
+    now = now or beijing_now()
+    rec = {"started": time.strftime("%Y-%m-%d %H:%M:%S"), "beijing": now.strftime("%Y-%m-%d %H:%M"), "steps": []}
+    log, finish = _recorder(runs, now, rec)
+
     steps = steps or {}
     if not force and now.weekday() >= 5:
         return {"outcome": "skipped", "note": "周末"}  # 不写状态，免得刷屏
+    if not force and (now.hour, now.minute) < (9, 30):
+        return _premarket(root, cache, registry, portfolio, force, now, steps)
     if not force and now.hour < 16:
-        return {"outcome": "skipped", "note": "北京时间 16:00 前，还没收盘结算"}
+        return {"outcome": "skipped", "note": "北京时间 09:30 到 16:00：已过盘前窗口、还没收盘"}
     last = cache_last_date(cache)
     if not force and last == now.date() and _done(runs, now.date()):
         return {"outcome": "skipped", "note": f"{now.date()} 已经处理过"}
@@ -155,17 +198,10 @@ def _run(root: Path, cache: Path, registry: Path, portfolio: Path, force: bool, 
             log("因子衰减监控：")
             mon = run_monitor(df, risk, FactorRegistry(registry), runs / "monitor", log=log)
         rec["steps"].append("monitor")
-        if "daily" in steps:
-            nav = steps["daily"]()
-        else:
-            from .cli import cmd_daily
-            ns = argparse.Namespace(data=str(cache), registry=str(registry), topk=20, out=str(portfolio),
-                                    paper=str(portfolio / "account.json"), capital=1_000_000, rebalance=5)
-            cmd_daily(ns)
-            acct = json.loads((portfolio / "account.json").read_text(encoding="utf-8"))
-            nav = acct["nav"][-1] if acct.get("nav") else None
-        rec["steps"].append("daily")
-        return finish("done", date=str(last), nav=nav, deactivated=mon.get("deactivated", []))
+        out = finish("done", date=str(last), deactivated=mon.get("deactivated", []))
+        if force:  # 手动强制跑：收盘后和盘前连着做
+            out["premarket"] = _premarket(root, cache, registry, portfolio, True, now, steps).get("outcome")
+        return out
     except (Exception, JobTimeout) as e:  # noqa: BLE001  记下来，下一次定时会再试
         log(traceback.format_exc())
         return finish("failed", date=str(now.date()), error=f"{type(e).__name__}: {e}")

@@ -1,6 +1,6 @@
 """定时运行每日任务（macOS launchd，用户级 LaunchAgent，不需要管理员权限）：`qharness schedule install / status / uninstall`。
 
-- 北京时间周一到周五 17:30、18:30、19:30 各触发一次（换算成本机时间），每日任务本身幂等，先到先做；
+- 北京时间周一到周五 08:30、09:00（盘前算组合、挂单）和 17:30、18:30、19:30（收盘后更新数据）各触发一次（换算成本机时间），每日任务本身幂等，先到先做；
   新浪一般收盘后 1~2 小时才发布当天行情，所以从 17:30 开始
 - 换算用安装时的时差：本机有夏令时的话，切换后触发时间按北京时间会差 1 小时，仍在收盘之后；也可以切换后重新安装
 - 电脑睡眠时错过的触发，launchd 会在唤醒后补跑一次；任务用 caffeinate -i 包着，跑起来之后不会因为空闲而睡过去
@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parent.parent
 LABEL = "com.qharness.daily"
 PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
-BEIJING_TIMES = ((17, 30), (18, 30), (19, 30))
+BEIJING_TIMES = ((8, 30), (9, 0), (17, 30), (18, 30), (19, 30))
 
 
 def local_slots(times=BEIJING_TIMES, now: datetime | None = None) -> list[dict]:

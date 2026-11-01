@@ -102,7 +102,7 @@ export default function Paper() {
           </div>
           <p className="ink2" style={{ marginBottom: 12 }}>
             每日任务按顺序做三件事：更新行情 → 因子衰减监控（失效的登记因子先停用）→ 选股、结算模拟账户。
-            北京时间周一到周五 17:30、18:30、19:30 各触发一次，当天处理完就不再重复；数据源还没发布行情就等下一次。
+            北京时间周一到周五 08:30、09:00 盘前算组合和挂单，17:30、18:30、19:30 收盘后更新数据，当天处理完就不再重复；数据源还没发布行情就等下一次。
             {!daily.data.schedule.loaded && <> 安装：<code>python -m qharness schedule install</code>（macOS，用户级，不需要管理员权限）。</>}
             {daily.data.schedule.loaded && daily.data.schedule.points_here === false && <> 注意：已安装的定时任务指向另一个目录。</>}
           </p>

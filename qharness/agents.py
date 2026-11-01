@@ -242,6 +242,21 @@ illiquidity_20d 非流动性、low_turnover_20d 低换手）的截面相关。
 - note 只描述对假设的修改，不要提任何指标名和数值。"""
 
 
+# 研究层的工具：候选在训练段和验证段方向都对时，由研究层决定组合参数，在验证段做策略回测。
+# 只在验证段（不碰测试段）；结果写进诊断和 trace，是否通过仍由规则决定。写代码的一层拿不到这个工具。
+RUN_BACKTEST_TOOL = {
+    "name": "run_qlib_backtest",
+    "description": "用 Qlib 回测（次日开盘成交、整手、双边费用、涨跌停和停牌不成交）对比基线和基线 + 候选因子，只在验证段。"
+                   "返回两者的年化超额、信息比率、超额最大回撤和换手。",
+    "input_schema": {"type": "object", "required": ["topk", "rebalance"],
+                     "properties": {"topk": {"type": "integer", "description": "持仓只数，10 到 50"},
+                                    "rebalance": {"type": "integer", "description": "调仓间隔（交易日），1 到 20"}}},
+}
+BACKTEST_SYSTEM = ("你是量化研究员。候选因子在训练段和验证段方向都对，现在设计验证段策略回测：结合换手和分组收益选择持仓只数和调仓间隔，"
+                   "调用 run_qlib_backtest。第一次结果需要换参数确认稳健性时可以再调用一次，否则直接用一句话说明结论。")
+MAX_BACKTESTS = 2
+
+
 class ResearchAgent:
     def __init__(self, llm: LLM, thresholds: Thresholds = Thresholds()):
         self.llm, self.th = llm, thresholds
@@ -316,13 +331,44 @@ class ResearchAgent:
                 return None, "direction_flip_insignificant"
         return clean, "ok"
 
-    def judge(self, hypothesis: dict, metrics: dict, can_refine: bool, n_trials: int = 1) -> Verdict:
+    def design_backtests(self, hypothesis: dict, metrics: dict, runner) -> list[dict]:
+        """研究层自己决定回测参数并调用工具，最多 MAX_BACKTESTS 次。模型或回测出错只记下来，不影响判定。"""
+        tr, va = metrics["train"], metrics["valid"]
+        if not (tr.get("valid") and va.get("valid") and tr.get("rank_ic", 0) > 0 and va.get("rank_ic", 0) > 0):
+            return []
+        msgs = [{"role": "user", "content": f"假设：{json.dumps({k: hypothesis.get(k) for k in HYPOTHESIS_KEYS}, ensure_ascii=False)}\n"
+                                            f"关键事实：\n- " + "\n- ".join(self.facts(metrics))}]
+        out: list[dict] = []
+        try:
+            for _ in range(MAX_BACKTESTS):
+                blocks = self.llm.respond("researcher", BACKTEST_SYSTEM, msgs, [RUN_BACKTEST_TOOL], {"hypothesis": hypothesis})
+                call = next((b for b in blocks if b.get("type") == "tool_use" and b.get("name") == RUN_BACKTEST_TOOL["name"]), None)
+                if call is None:
+                    break
+                args = call.get("input") or {}
+                topk = min(50, max(10, int(args.get("topk", 20))))
+                rebalance = min(20, max(1, int(args.get("rebalance", 5))))
+                res = runner(topk, rebalance)
+                out.append(res)
+                msgs += [{"role": "assistant", "content": blocks},
+                         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call["id"],
+                                                       "content": json.dumps(res, ensure_ascii=False, default=str)}]}]
+        except NotImplementedError:
+            return out
+        except Exception as e:  # noqa: BLE001
+            out.append({"error": f"{type(e).__name__}: {e}"})
+        return out
+
+    def judge(self, hypothesis: dict, metrics: dict, can_refine: bool, n_trials: int = 1, backtest=None) -> Verdict:
         rule = self.rules(metrics, n_trials)
+        backtests = self.design_backtests(hypothesis, metrics, backtest) if backtest else []
         ctx = {"hypothesis": {k: hypothesis.get(k) for k in HYPOTHESIS_KEYS}, "metrics": metrics, "rule_verdict": rule}
         prompt = (f"假设：{json.dumps(ctx['hypothesis'], ensure_ascii=False)}\n"
                   f"关键事实（已由程序核对，以此为准）：\n- " + "\n- ".join(self.facts(metrics)) + "\n"
                   f"回测结果：{json.dumps(metrics, ensure_ascii=False)}\n"
-                  f"规则判定：{json.dumps(rule, ensure_ascii=False)}")
+                  f"规则判定：{json.dumps(rule, ensure_ascii=False)}"
+                  + (f"\n验证段策略回测（只作诊断依据，不改变规则判定）：{json.dumps(backtests, ensure_ascii=False, default=str)}"
+                     if backtests else ""))
         msgs = [{"role": "system", "content": RESEARCH_SYSTEM}, *self.history[-4:], {"role": "user", "content": prompt}]
         try:
             out = extract_json(self.llm.chat("researcher", msgs, ctx))
@@ -334,6 +380,7 @@ class ResearchAgent:
         clean_rev, rev_check = self.check_revision(hypothesis, rev, out.get("findings") or [], metrics)
         rule["revision_check"] = rev_check
         rule["findings"] = out.get("findings") or []
+        rule["backtests"] = backtests
         note = sanitize_note((rev or {}).get("note", ""))
         if rule["passed"]:
             return Verdict("accept", [], out.get("diagnosis", ""), None, "", rule)

@@ -302,12 +302,24 @@ class FactorHarness:
             self.tr.log("experience.add", kind="fix", error_type=last["error_type"], result=r)
         return upd
 
+    def _backtest_tool(self, code: str):
+        """研究层的回测工具：没有 Qlib 数据时不提供。"""
+        from . import qlib_bridge as qb
+        from .strategy import validation_backtest
+
+        if not qb.available():
+            return None
+        return lambda topk, rebalance: validation_backtest(self.ev, self._values(code), topk, rebalance)
+
     def _n_judge(self, s):
         """研究层判定：只看结构化结果，看不到代码。"""
         h, report, refine = s["h"], s["report"], s["refine"]
         n_trials = s["prior_trials"] + refine + 1
         researcher = self._researcher(s)
-        v = researcher.judge(h, report["metrics"], can_refine=refine < self.limits.max_refine, n_trials=n_trials)
+        v = researcher.judge(h, report["metrics"], can_refine=refine < self.limits.max_refine, n_trials=n_trials,
+                             backtest=self._backtest_tool(report["code"]))
+        for b in v.rule_details.get("backtests") or []:
+            self.tr.log("research.backtest", round=refine, **b)
         entry = {"round": refine, "hypothesis": dict(h), "metrics": report["metrics"],
                  "verdict": v.verdict, "failed": v.failed, "diagnosis": v.diagnosis,
                  "revision": v.revision, "fixes": s["fixes"], "first_try_ok": s["fixes"] == 0,
