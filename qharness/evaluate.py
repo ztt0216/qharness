@@ -80,7 +80,8 @@ class TestSetLocked(RuntimeError):
 
 class Evaluator:
     def __init__(self, df: pd.DataFrame, split: Split | None = None, n_groups: int = 5,
-                 risk: pd.DataFrame | None = None, test_log: str | None = None):
+                 risk: pd.DataFrame | None = None, test_log: str | None = None,
+                 extra_library: dict[str, pd.Series] | None = None):
         self.df = df.sort_index()
         self.split = split or make_split(self.df)
         self.label_w = _wide(make_label(self.df))
@@ -88,7 +89,9 @@ class Evaluator:
         self.risk = risk
         self.neutralized = risk is not None
         self.raw_library = baseline_library(self.df, risk)
-        self.library = {k: self._prep(v) for k, v in self.raw_library.items()}
+        # 相关性比较的因子库：基础因子 + 已登记因子（extra_library）。不加登记因子的话，和已登记的 EP 高度相关的 BP
+        # 也能过「和因子库相关不超过 0.7」这一关，组合会在价值上重复加仓
+        self.library = {k: self._prep(v) for k, v in {**self.raw_library, **(extra_library or {})}.items()}
         # 测试段锁：传了 test_log 就落盘，进程中断后续跑也不能把同一个因子的测试段再开一次
         self._test_log = test_log
         self._test_opened: set[str] = set()
@@ -163,15 +166,27 @@ class Evaluator:
             "valid": self._segment_metrics(fw, segment_dates(self.df, self.split.valid), raw),
         }
 
-    def evaluate_test(self, factor: pd.Series, key: str) -> dict:
-        """测试段对每个因子（key，一般是代码）只开放一次，结果不回流到研究循环。"""
-        h = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    def _value_keys(self, factor: pd.Series) -> list[str]:
+        """按因子值认身份：测试段每天的截面分位数（保留 4 位）+ 数据范围。分位数对单调变换不变（2×EP、EP+常数是同一个因子），
+        取反后的分位数是 1 − 原值，一起锁上：看过测试段之后不能翻个方向再开一次。换了数据范围（比如扩大股票池）算新的测试。"""
+        d = segment_dates(self.df, self.split.test)
+        w = _wide(factor.reindex(self.df.index)).loc[d]
+        r = ((w.rank(axis=1) - 0.5).div(w.count(axis=1), axis=0)).round(4)  # (名次 − 0.5) / n：取反后正好是 1 − 原值
+        sig = f"{d[0].date()}|{d[-1].date()}|{w.shape[1]}|".encode()
+        pos = r.fillna(-1).to_numpy().tobytes()
+        neg = (1 - r).round(4).fillna(-1).to_numpy().tobytes()
+        return [hashlib.sha1(sig + b"v" + pos).hexdigest(), hashlib.sha1(sig + b"v" + neg).hexdigest()]
+
+    def evaluate_test(self, factor: pd.Series, key: str | None = None) -> dict:
+        """测试段对每个因子只开放一次，结果不回流到研究循环。身份按因子值认（见 _value_keys），
+        另外给了 key（比如模型配置）也一起记；锁记在 test_log 里（研究运行用全局的 runs/test_opened.txt，跨运行生效）。"""
+        keys = self._value_keys(factor) + ([hashlib.sha1(key.encode("utf-8")).hexdigest()] if key else [])
         with self._test_lock:  # 候选并行：查和记要一起做
-            if h in self._test_opened:
-                raise TestSetLocked("这个因子的测试段已经评估过一次，不能重复使用")
-            self._test_opened.add(h)
+            if any(k in self._test_opened for k in keys):
+                raise TestSetLocked("这个因子（或它的单调变换、取反）的测试段已经评估过一次，不能重复使用")
+            self._test_opened.update(keys)
             if self._test_log:
                 with open(self._test_log, "a", encoding="utf-8") as f:
-                    f.write(h + "\n")
+                    f.write("\n".join(keys) + "\n")
         fw, raw = self._prep(factor), (_wide(factor.reindex(self.df.index)) if self.neutralized else None)
         return {"test": self._segment_metrics(fw, segment_dates(self.df, self.split.test), raw)}

@@ -115,7 +115,10 @@ def build(args):
     llm = make_llm(args.llm)
     llm.calls_file = tr.dir / "llm_calls.jsonl"
     df, risk = (load_csv_panel(args.csv), None) if args.csv else load_hs300(Path(args.data))
-    ev = Evaluator(df, risk=risk, test_log=str(tr.dir / "test_opened.txt"))  # 测试段锁落盘，续跑也只开一次
+    # 测试段锁用全局文件：跨运行生效（原来每次运行一个文件，新开一次运行同一个因子就能再看测试段）；
+    # 相关性比较带上已登记因子
+    registered = FactorRegistry(Path(args.registry)).compute(df) if not args.csv else {}
+    ev = Evaluator(df, risk=risk, test_log=str(Path(args.runs) / "test_opened.txt"), extra_library=registered)
     store = ExperienceStore(args.experience)
     ckpt = None if args.no_checkpoint else open_checkpointer(tr.dir / "checkpoints.sqlite")
     return llm, ev, store, tr, ckpt

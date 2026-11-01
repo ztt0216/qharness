@@ -1034,3 +1034,23 @@ def test_daily_job_fundamentals_failure_does_not_block(tmp_path):
     r = run_daily_job(tmp_path, cache, tmp_path / "f", tmp_path / "p", steps=steps,
                       now=datetime(2026, 11, 2, 18, 0, tzinfo=BEIJING))
     assert r["outcome"] == "done" and r["steps"] == ["update", "monitor", "daily"] and "baostock 断开" in r["warnings"][0]
+
+
+def test_test_lock_by_values_blocks_transforms_and_flips(df, tmp_path):
+    """测试段锁按因子值认身份：单调变换、取反都算同一个因子；跨 Evaluator 实例（跨运行）生效；数据范围不同算新测试。"""
+    log = str(tmp_path / "opened.txt")
+    r = execute_factor(GOOD, df)
+    Evaluator(df, test_log=log).evaluate_test(r.values)
+    for variant in (2 * r.values + 3, -r.values, r.values.rank()):
+        with pytest.raises(_Locked):
+            Evaluator(df, test_log=log).evaluate_test(variant)
+    short = df[df.index.get_level_values("datetime") < df.index.get_level_values("datetime").unique()[-60]]
+    Evaluator(short, test_log=log).evaluate_test(r.values.reindex(short.index))  # 测试段不同：允许
+
+
+def test_registered_factors_join_correlation_library(df):
+    """已登记因子进入相关性比较：和它高度相关的新候选会被看出来。"""
+    r = execute_factor(GOOD, df)
+    plain = Evaluator(df).evaluate(r.values * 1.5)["valid"]["max_abs_corr_with_library"]
+    withreg = Evaluator(df, extra_library={"已登记": r.values}).evaluate(r.values * 1.5)["valid"]
+    assert withreg["corr_with_library"]["已登记"] > 0.99 and withreg["max_abs_corr_with_library"] > plain
