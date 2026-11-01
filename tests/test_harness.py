@@ -969,3 +969,68 @@ def test_daily_job_time_limit(tmp_path):
     r = run_daily_job(tmp_path, cache, tmp_path / "f", tmp_path / "p", steps=steps, max_seconds=1,
                       now=datetime(2026, 11, 2, 18, 0, tzinfo=BEIJING))
     assert r["outcome"] == "failed" and "超过 1 秒" in r["error"] and _time.time() - t < 5
+
+
+def test_fundamentals_point_in_time(tmp_path):
+    """财务按公告日对齐：公告日之后第一个交易日才生效；同日公布两期取报告期新的；晚公布的旧报告期更正不回退。"""
+    from qharness.fundamentals import load_fundamentals
+
+    cal = pd.bdate_range("2025-04-25", "2025-05-09")  # 4-30 周三公布年报和一季报，5-01~05 放假（这里用工作日近似）
+    panel = pd.DataFrame({"close": 1.0}, index=pd.MultiIndex.from_product([cal, ["SH600000"]], names=["datetime", "instrument"]))
+    (tmp_path / "ref" / "fin").mkdir(parents=True)
+    (tmp_path / "ref" / "val").mkdir(parents=True)
+    pd.DataFrame([
+        {"year": 2024, "quarter": 3, "pubDate": "2024-10-30", "statDate": "2024-09-30", "roe": 0.05, "yoy_ni": 0.1},
+        {"year": 2024, "quarter": 4, "pubDate": "2025-04-30", "statDate": "2024-12-31", "roe": 0.08, "yoy_ni": 0.2},
+        {"year": 2025, "quarter": 1, "pubDate": "2025-04-30", "statDate": "2025-03-31", "roe": 0.02, "yoy_ni": 0.3},
+        {"year": 2024, "quarter": 2, "pubDate": "2025-05-06", "statDate": "2024-06-30", "roe": 0.99, "yoy_ni": 0.9},  # 更正旧报告期
+        {"year": 2025, "quarter": 2, "pubDate": "", "statDate": "", "roe": None, "yoy_ni": None},                    # 还没公布
+    ]).to_csv(tmp_path / "ref" / "fin" / "sh.600000.csv", index=False)
+    pd.DataFrame({"date": cal.strftime("%Y-%m-%d"), "pe_ttm": range(len(cal)), "pb_mrq": 1.0, "ps_ttm": 1.0,
+                  "pcf_ttm": -2.0}).to_csv(tmp_path / "ref" / "val" / "sh.600000.csv", index=False)
+    f = load_fundamentals(panel, tmp_path).xs("SH600000", level="instrument")
+    assert f.loc["2025-04-30", "roe"] == 0.05            # 公告当天还不能用
+    assert f.loc["2025-05-01", "roe"] == 0.02            # 次日生效，同日两期取报告期新的（一季报）
+    assert f.loc["2025-05-09", "roe"] == 0.02            # 5-06 的旧报告期更正不回退
+    assert f.loc["2025-05-02", "pe_ttm"] == list(cal).index(pd.Timestamp("2025-05-02"))  # 估值按日直接对上
+    assert list(f.columns[:4]) == ["pe_ttm", "pb_mrq", "ps_ttm", "pcf_ttm"]
+
+
+def test_fundamental_fields_reach_factor_code_and_prompts(df):
+    """有财务列时：因子代码能用、字段说明写进提示词、缺失数据说明不再说没有财务；预筛按本地数据判断能否检验。"""
+    from qharness.data import describe_fields, factor_columns, missing_data_note
+    from qharness.report_fetch import decide
+
+    d = df.copy()
+    d["pe_ttm"] = d["close"] / 3 + 5
+    d["roe"] = 0.1
+    cols = factor_columns(d)
+    assert "pe_ttm" in cols and "roe" in cols
+    r = execute_factor("def factor(df):\n    return 1 / df['pe_ttm']", d)
+    assert r.ok, r.message
+    assert "按公告日之后第一个交易日生效" in describe_fields(cols) and "财务（ROE" not in missing_data_note(cols)
+    assert "财务（ROE" in missing_data_note(factor_columns(df))
+    out = {"type": "截面选股因子", "factors": [{"name": "EP", "data": "估值"}]}
+    assert not decide(out, ("日频行情",))[0] and decide(out, ("日频行情", "估值", "季报财务", "财务"))[0]
+
+
+def test_daily_job_fundamentals_failure_does_not_block(tmp_path):
+    """财务和估值更新失败只记警告，照常监控和结算。"""
+    from datetime import datetime
+    from qharness.daily_job import BEIJING, run_daily_job
+
+    cache = tmp_path / "data"
+    cache.mkdir()
+    f = cache / "sh.600000.csv"
+    f.write_text("date,code,close\n2026-10-30,sh.600000,1\n", encoding="utf-8")
+
+    def update(c):
+        f.write_text(f.read_text() + "2026-11-02,sh.600000,1\n")
+        return {"appended": 1, "no_new_data": 0, "failed": []}
+
+    def fundamentals(c):
+        raise ConnectionError("baostock 断开")
+    steps = {"update": update, "fundamentals": fundamentals, "monitor": lambda: {}, "daily": lambda: None}
+    r = run_daily_job(tmp_path, cache, tmp_path / "f", tmp_path / "p", steps=steps,
+                      now=datetime(2026, 11, 2, 18, 0, tzinfo=BEIJING))
+    assert r["outcome"] == "done" and r["steps"] == ["update", "monitor", "daily"] and "baostock 断开" in r["warnings"][0]

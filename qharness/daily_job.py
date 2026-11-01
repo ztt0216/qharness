@@ -1,4 +1,4 @@
-"""每日任务（`qharness daily-job`）：更新行情 → 因子衰减监控 → 每日持仓和模拟账户结算，给定时任务调用。
+"""每日任务（`qharness daily-job`）：更新行情 → 更新财务和估值 → 因子衰减监控 → 每日持仓和模拟账户结算，给定时任务调用。
 
 - 按北京时间判断：周末不跑；收盘前（16:00 前）不跑
 - 幂等：当天已经处理完就直接退出（不联网），所以一晚上可以安排多次，先到先做
@@ -127,6 +127,18 @@ def _run(root: Path, cache: Path, registry: Path, portfolio: Path, force: bool, 
                 return finish("no_new_data", date=str(now.date()),
                               note="数据源还没有当天行情（或今天休市），等下一次")
             last = new_last
+            if "fundamentals" in steps or "update" not in steps:
+                try:  # 估值追加、财务每周重下最近两个季度；失败不挡结算，财务晚一天更新问题不大
+                    if "fundamentals" in steps:
+                        fs = steps["fundamentals"](cache)
+                    else:
+                        from .fundamentals import update as update_fundamentals
+                        fs = update_fundamentals(cache, log=log)
+                    rec["steps"].append("fundamentals")
+                    log(f"财务和估值更新：{fs if 'skipped' in fs else {k: {kk: (len(vv) if isinstance(vv, list) else vv) for kk, vv in v.items()} for k, v in fs.items()}}")
+                except Exception as e:  # noqa: BLE001
+                    rec.setdefault("warnings", []).append(f"财务和估值更新失败：{type(e).__name__}: {e}")
+                    log(f"警告：财务和估值更新失败（{type(e).__name__}: {e}），继续用已有数据")
             if "update" not in steps:
                 qlib = root / "data" / "qlib_cn"
                 if (qlib / "calendars" / "day.txt").exists():

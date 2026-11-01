@@ -14,7 +14,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from statistics import NormalDist
 
-from .data import factor_columns
+from .data import describe_fields, factor_columns
 from .evaluate import Evaluator
 from .llm import LLM, extract_code, extract_json
 from .sandbox import ExecResult, execute_factor
@@ -37,7 +37,8 @@ CODER_SYSTEM = """你是因子开发工程师。根据因子假设写 Python 代
 数据约定：
 - 定义 def factor(df: pd.DataFrame) -> pd.Series
 - df 的索引是 MultiIndex (datetime, instrument)，按 (datetime, instrument) 排序；列只有 {columns}
-- 价格是后复权价；停牌日整行为 NaN；amount 单位元，volume 单位股，turnover（如有）为日换手率
+- 字段含义：{field_desc}
+- 价格是后复权价；停牌日整行为 NaN；amount 单位元，volume 单位股；财务字段已按公告日对齐，直接用当天的值即可，不要再 shift
 - 返回与 df.index 对齐的一列数（每天每只股票一个分数）
 规则：
 - 只能 import numpy / pandas / math
@@ -141,7 +142,8 @@ class ExperimentAgent:
         self.prompts.append(prompt)
         columns = ", ".join(factor_columns(self.evaluator.df))
         if not self.use_tools:
-            system = CODER_SYSTEM.format(columns=columns, submit=SUBMIT_TEXT)
+            system = CODER_SYSTEM.format(columns=columns, submit=SUBMIT_TEXT,
+                                         field_desc=describe_fields(factor_columns(self.evaluator.df)))
             msgs = [{"role": "system", "content": system}, *self.history[-4:], {"role": "user", "content": prompt}]
             reply = self.llm.chat("coder", msgs, task)
             self.history += [{"role": "user", "content": prompt}, {"role": "assistant", "content": reply}]
@@ -152,7 +154,8 @@ class ExperimentAgent:
         tools, submit = [RUN_FACTOR_TOOL], SUBMIT_TOOL
         if qb.available():
             tools, submit = [RUN_FACTOR_TOOL, RUN_QLIB_TOOL], SUBMIT_TOOL_QLIB
-        system = CODER_SYSTEM.format(columns=columns, submit=submit)
+        system = CODER_SYSTEM.format(columns=columns, submit=submit,
+                                     field_desc=describe_fields(factor_columns(self.evaluator.df)))
         if len(tools) > 1:
             system += "\n" + QLIB_HELP.format(fields=", ".join("$" + c for c in factor_columns(self.evaluator.df)))
         # 上一次工具调用的结果必须放在下一条 user 消息的最前面（tool_use / tool_result 成对）

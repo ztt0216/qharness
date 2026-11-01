@@ -317,13 +317,17 @@ def load_hs300_panel(cache: Path = DEFAULT_CACHE, min_days: int = 60, universe: 
 
 
 def load_hs300(cache: Path = DEFAULT_CACHE, universe: str = "research") -> tuple[pd.DataFrame, pd.DataFrame | None]:
-    """行情面板（有市值数据时附带 turnover 列）+ 风险数据（市值、行业、停牌、涨跌停）。"""
+    """行情面板（有市值数据时附带 turnover 列，下载过财务数据时附带估值和财务列）+ 风险数据（市值、行业、停牌、涨跌停）。"""
     from .risk import load_risk, turnover_rate
 
     df = load_hs300_panel(cache, universe=universe)
     to = turnover_rate(df, cache)
     if to is not None:
         df["turnover"] = to
+    from .fundamentals import load_fundamentals
+    fund = load_fundamentals(df, cache)  # 估值和财务（按公告日对齐），下载过才有
+    if fund is not None:
+        df = df.join(fund)
     has_ref = (Path(cache) / "ref").exists()
     return df, (load_risk(df, cache) if has_ref else None)
 

@@ -12,6 +12,7 @@ from typing import TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from . import retrieval
+from .data import describe_fields, missing_data_note
 from .experience import similarity
 from .llm import LLM, extract_json
 from .trace import Tracer
@@ -266,8 +267,7 @@ class ReportSOP:
             ctx = {"viewpoint": vp, "node": nodes.get(vp["id"]), "fields": fields, "neutralized": neutralized}
             out = _ask(self.llm, "sop.hypothesis",
                        "因子是截面选股：每天在股票之间比较，分数高的股票未来收益应更高。"
-                       f"可用数据只有个股日频字段 {fields}（turnover 为日换手率），没有财务数据（PE/PB/ROE/盈利增速等）、"
-                       "宏观、资金流、指数数据，也没有日内分钟、逐笔成交、委托单数据。" + neutral_note +
+                       f"可用数据只有这些个股字段：{describe_fields(fields)}。{missing_data_note(fields)}。" + neutral_note +
                        "研报的变量如果是用日内 / 逐笔 / 订单数据定义的（如尾盘成交占比、大单小单、主动买卖），"
                        "日频字段只能近似，近似出来的不是研报的因子，判为不可检验，reason 写明需要什么数据。"
                        "可检验：描述股票之间差异的判断，例如「高 X 的股票跑赢低 X 的股票」「A 股存在 X 效应」"
@@ -316,8 +316,8 @@ class ReportSOP:
             ctx = {"hypothesis": h, "viewpoint": vp["claim"], "evidence": evid.get(vp["id"], [])}
             out = _ask(self.llm, "sop.faithful",
                        "判断两件事：1) 因子假设是不是研报观点或研报其他段落直接描述的变量（研报没提到、由模型联想出来的不算）；"
-                       f"2) 只用日频字段 {fields} 能不能精确算出研报定义的这个变量（研报用日内 / 逐笔 / 订单数据或财务数据定义、"
-                       "这里只能近似的，算不能；用股价代替市值这类替代也算不能）。"
+                       f"2) 只用这些字段 {fields} 能不能精确算出研报定义的这个变量（{missing_data_note(fields)}；"
+                       "研报用这些缺失数据定义、这里只能近似的，算不能；用股价代替市值这类替代也算不能）。"
                        "两条都满足 faithful 才为 true。输出 {\"faithful\": true/false, \"exact\": true/false, \"reason\": \"...\"}\n"
                        f"观点：{vp['claim']}\n原文论据：{json.dumps(evid.get(vp['id'], []), ensure_ascii=False)}\n"
                        f"研报中的相关定义和段落：{json.dumps(self._definitions(s, h.get('name', ''), str(h.get('calculation', '')), vp['claim']), ensure_ascii=False)}\n"

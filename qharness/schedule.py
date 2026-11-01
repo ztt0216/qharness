@@ -3,7 +3,8 @@
 - 北京时间周一到周五 17:30、18:30、19:30 各触发一次（换算成本机时间），每日任务本身幂等，先到先做；
   新浪一般收盘后 1~2 小时才发布当天行情，所以从 17:30 开始
 - 换算用安装时的时差：本机有夏令时的话，切换后触发时间按北京时间会差 1 小时，仍在收盘之后；也可以切换后重新安装
-- 电脑睡眠时错过的触发，launchd 会在唤醒后补跑一次
+- 电脑睡眠时错过的触发，launchd 会在唤醒后补跑一次；任务用 caffeinate -i 包着，跑起来之后不会因为空闲而睡过去
+  （合上盖子仍会睡眠：要每天自动跑，电脑需要开着、接电源）
 - 日志：runs/daily/launchd.log（进程输出）、runs/daily/<日期>.log（每日任务）
 """
 from __future__ import annotations
@@ -39,7 +40,9 @@ def plist_dict(root: Path = ROOT) -> dict:
     logdir = root / "runs" / "daily"
     return {
         "Label": LABEL,
-        "ProgramArguments": [sys.executable, "-m", "qharness", "daily-job"],
+        # caffeinate -i：任务运行期间不让系统空闲睡眠（实测这台 Mac 空闲 1 分钟就睡，任务只能在维护唤醒的几十秒里一点点跑）；
+        # 进程结束就失效，不改系统设置；合上盖子的睡眠挡不住
+        "ProgramArguments": ["/usr/bin/caffeinate", "-i", sys.executable, "-m", "qharness", "daily-job"],
         "WorkingDirectory": str(root),
         "StartCalendarInterval": local_slots(),
         "StandardOutPath": str(logdir / "launchd.log"),

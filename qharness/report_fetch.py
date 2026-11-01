@@ -38,6 +38,13 @@ TITLE_NEG = re.compile(r"周报|日报|晨会|早报|早参|月报|周观察|周
                        r"配置|择时|行业轮动|风格轮动|港股|美股|海外|大宗|商品|黄金|原油|REITs|ESG|业绩|财报|年报|中报|季报|"
                        r"北向|两融|IPO|新股|指数基金|产品|保险|点评", re.I)
 DAILY_DATA = ("日频行情",)
+FUNDAMENTAL_DATA = ("估值", "季报财务", "财务")  # 「财务」是旧版预筛输出的类别，兼容
+
+
+def testable_data(cache: Path | None = None) -> tuple[str, ...]:
+    """现在能检验的数据类别：日频行情；下载过财务和估值数据（fundamentals.py）后再加估值、季报财务。"""
+    fin = Path(cache or ROOT / "data" / "hs300") / "ref" / "fin"
+    return DAILY_DATA + (FUNDAMENTAL_DATA if fin.exists() and any(fin.glob("*.csv")) else ())
 INTRADAY_HITS_MAX = 8  # 全文日内数据标记超过这个数，判为因子依赖日内数据
 
 
@@ -128,13 +135,17 @@ def download(index: ReportIndex, code: str, max_mb: float = 30, opener=urllib.re
     return dest
 
 
-SCREEN_PROMPT = """下面是一篇券商研报的标题和前几页。判断它能不能用来做「截面选股因子」研究，并且只用 A 股日频行情就能验证。
-日频行情只有：开盘价、最高价、最低价、收盘价、成交量、成交额、换手率（每只股票每天一行）。
+SCREEN_PROMPT = """下面是一篇券商研报的标题和前几页。判断它能不能用来做「截面选股因子」研究，以及每个因子要用什么数据。
+数据类别：
+- 日频行情：开盘价、最高价、最低价、收盘价、成交量、成交额、换手率（每只股票每天一行）
+- 估值：PE、PB、PS、PCF 这类估值倍数
+- 季报财务：ROE、净利率、毛利率、EPS、净利润，以及净利润、净资产、总资产的同比增速
+- 资产负债表或现金流细项：应收、存货、负债结构、经营现金流、资本开支等具体科目
 
 只输出 JSON：
 {{"type": "截面选股因子" | "择时" | "资产配置或行业轮动" | "策略或产品介绍" | "其他",
   "factors": [{{"name": "因子名", "definition": "研报里的定义（一句话，没有就写未给出）",
-               "data": "日频行情" | "财务" | "分析师预期" | "日内或逐笔" | "其他"}}],
+               "data": "日频行情" | "估值" | "季报财务" | "资产负债表或现金流细项" | "分析师预期" | "日内或逐笔" | "其他"}}],
   "reason": "一句话结论"}}
 
 要求：
@@ -226,19 +237,21 @@ def run_inbox(llm=None, research_max: int = 0, index: ReportIndex | None = None,
 SIZE = re.compile(r"市值|规模|size", re.I)
 
 
-def decide(out: dict) -> tuple[bool, str]:
-    """按模型的预筛输出决定是否送进研究（程序复核）。
+def decide(out: dict, testable: tuple[str, ...] | None = None) -> tuple[bool, str]:
+    """按模型的预筛输出决定是否送进研究（程序复核）。testable：现在能检验的数据类别（默认看本地下载了什么）。
     市值因子不算：评估时对市值做中性化，市值本身测不出东西（模型常把它归为日频行情）。"""
+    testable = testable or testable_data()
     factors = [f for f in out.get("factors") or [] if isinstance(f, dict)]
     size = [f for f in factors if SIZE.search(f.get("name", ""))]
-    daily = [f for f in factors if f.get("data") in DAILY_DATA and f not in size]
+    ok = [f for f in factors if f.get("data") in testable and f not in size]
     if out.get("type") != "截面选股因子":
         return False, f"不是截面选股因子研报（{out.get('type')}）：{out.get('reason', '')}"
-    if daily:
-        return True, f"{len(daily)} 个因子只用日频行情：{'、'.join(f.get('name', '?') for f in daily[:4])}"
+    if ok:
+        kinds = sorted({f.get("data") for f in ok})
+        return True, f"{len(ok)} 个因子可以检验（{'、'.join(kinds)}）：{'、'.join(f.get('name', '?') for f in ok[:4])}"
     need = sorted({f.get("data", "?") for f in factors if f not in size})
     note = f"市值因子（{'、'.join(f.get('name', '') for f in size)}）在评估时被中性化，不算；" if size else ""
-    return False, f"{note}其余因子要用日频行情以外的数据（{'、'.join(need) or '没有其他因子'}）"
+    return False, f"{note}其余因子要用现在没有的数据（{'、'.join(need) or '没有其他因子'}）"
 
 
 def screen(index: ReportIndex, code: str, llm, max_chars: int = 5000) -> dict:
