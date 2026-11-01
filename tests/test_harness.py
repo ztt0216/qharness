@@ -1165,3 +1165,95 @@ def test_research_designs_validation_backtest():
     assert v.verdict == ("accept" if v.rule_details["passed"] else "reject")
     neg = {**seg, "rank_ic": -0.03}
     assert ResearchAgent(LLM()).design_backtests(h, {"train": seg, "valid": neg}, runner) == [] and len(calls) == 1
+
+
+# ---------------------------------------------------------------- MCP 服务
+
+LEAK = "def factor(df):\n    raise ValueError(f\"MAXDATE={df.index.get_level_values('datetime').max()}\")"
+
+
+def _mcp_call(tools, calls):
+    """真实 MCP 协议（内存传输）走一遍：列工具 + 调工具。"""
+    import anyio
+    from mcp import Client
+    from qharness.mcp_server import build_server
+
+    async def go():
+        async with Client(build_server(tools)) as c:
+            names = {t.name for t in (await c.list_tools()).tools}
+            return names, [await c.call_tool(n, a) for n, a in calls]
+    return anyio.run(go)
+
+
+def _mcp_tools(df, risk, role, tmp_path):
+    from qharness.mcp_server import Tools
+    return Tools(df, risk, role, tmp_path / "exp.jsonl", tmp_path / "runs")
+
+
+def test_mcp_coder_has_no_backtest_or_test_access(df, risk, tmp_path, qlib_env):
+    names, (ok, leak) = _mcp_call(_mcp_tools(df, risk, "coder", tmp_path),
+                                  [("run_factor", {"code": GOOD}), ("run_factor", {"code": LEAK})])
+    assert names == {"run_factor", "run_qlib_factor", "search_experience"}
+    view = ok.structured_content
+    assert view["ok"] and set(view) == {"ok", "checks"}  # 只有执行状态和口径检查，没有收益指标
+    ev = Evaluator(df)
+    import re
+    seen = pd.Timestamp(re.search(r"MAXDATE=(\d{4}-\d{2}-\d{2})", leak.structured_content["message"]).group(1))
+    assert seen <= ev.split.valid[1] < ev.split.test[0]  # 因子代码碰不到测试段，报错也带不出来
+    assert leak.structured_content["error_type"] == ErrorType.RUNTIME
+    assert not (tmp_path / "runs" / "test_opened.txt").exists()
+
+
+def test_mcp_experience_filtered_by_role(df, tmp_path):
+    store = ExperienceStore(tmp_path / "exp.jsonl")
+    store.add(Experience("rejected", "量价相关性因子", {"reason": "验证段 RankIC -0.03"}))
+    store.add(Experience("success", "量价相关性因子实现", {"code": GOOD, "direction_by_harness": True}))
+    q = {"query": "量价相关性因子", "k": 5}
+    _, (coder,) = _mcp_call(_mcp_tools(df, None, "coder", tmp_path), [("search_experience", q)])
+    _, (research,) = _mcp_call(_mcp_tools(df, None, "research", tmp_path), [("search_experience", q)])
+    assert {h["kind"] for h in coder.structured_content["hits"]} == {"success"}
+    assert {h["kind"] for h in research.structured_content["hits"]} == {"success", "rejected"}
+    _, (denied,) = _mcp_call(_mcp_tools(df, None, "coder", tmp_path), [("search_experience", {**q, "kind": "rejected"})])
+    assert denied.is_error and "只能检索" in denied.content[0].text
+
+
+def test_mcp_backtest_limit_survives_restart_and_rewrites(df, risk, tmp_path, qlib_env):
+    args = {"code": GOOD, "topk": 10, "rebalance": 5}
+    names, (a, b) = _mcp_call(_mcp_tools(df, risk, "research", tmp_path),
+                              [("run_validation_backtest", args), ("run_validation_backtest", {**args, "topk": 20})])
+    assert "run_validation_backtest" in names and not a.is_error and not b.is_error
+    assert Evaluator(df).split.valid[1].strftime("%Y-%m-%d") >= a.structured_content["segment"][-10:]
+    # 重启服务 + 翻方向 + 改写法：还是同一个因子，不能继续调参
+    rewritten = GOOD.replace("g = df", "grouped = df").replace("-g.apply", "-grouped.apply")
+    _, (c, d) = _mcp_call(_mcp_tools(df, risk, "research", tmp_path),
+                          [("run_validation_backtest", {**args, "direction": -1}),
+                           ("run_validation_backtest", {**args, "code": rewritten})])
+    assert c.is_error and d.is_error and "已经回测过 2 次" in c.content[0].text and "已经回测过 2 次" in d.content[0].text
+    _, (bad,) = _mcp_call(_mcp_tools(df, risk, "research", tmp_path),
+                          [("run_validation_backtest", {**args, "topk": 500})])  # 超范围由协议层的 schema 拒绝
+    assert bad.is_error
+    assert not (tmp_path / "runs" / "test_opened.txt").exists()
+
+
+def test_mcp_stdio_end_to_end(tmp_path):
+    """真的启动 python -m qharness mcp：沙箱子进程 spawn 和因子里的 print 都不能破坏 stdio 协议。"""
+    import sys
+
+    import anyio
+    from mcp import ClientSession, StdioServerParameters, stdio_client
+
+    fixture = Path(__file__).parent / "fixtures" / "hs300_sample.csv.gz"
+    noisy = GOOD.replace("import pandas as pd", "import pandas as pd\nprint('noise')")
+    params = StdioServerParameters(command=sys.executable, cwd=str(ROOT),
+                                   args=["-m", "qharness", "mcp", "--csv", str(fixture), "--runs", str(tmp_path),
+                                         "--experience", str(tmp_path / "exp.jsonl")])
+
+    async def go():
+        async with stdio_client(params) as (r, w):
+            async with ClientSession(r, w) as s:
+                await s.initialize()
+                names = {t.name for t in (await s.list_tools()).tools}
+                return names, await s.call_tool("run_factor", {"code": noisy})
+    names, res = anyio.run(go)
+    assert names == {"run_factor", "search_experience"}  # CSV 模式没有 Qlib 工具
+    assert res.structured_content["ok"], res.structured_content

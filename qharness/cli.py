@@ -8,6 +8,7 @@
   python -m qharness factors                      查看登记因子
   python -m qharness eval-research --env-file .env  研究层评测集
   python -m qharness experience                   查看经验库
+  python -m qharness mcp --role coder             MCP 服务（stdio）：沙箱、经验检索、验证段回测
 """
 from __future__ import annotations
 
@@ -435,6 +436,14 @@ def main(argv=None):
     er = sub.add_parser("eval-retrieval", help="检索评测：字面 / 语义 / 混合在真实运行记录上的对比")
     er.add_argument("--no-llm", action="store_true", help="不跑改写查询那组（要调用模型）")
     er.add_argument("--out", default=str(ROOT / "runs" / "retrieval_eval.json"))
+    mc = sub.add_parser("mcp", help="MCP 服务（stdio）：沙箱、经验检索、验证段回测；不开放测试段和因子登记")
+    mc.add_argument("--role", choices=["coder", "research"], default="coder", help="research 才有回测工具和完整经验")
+    mc.add_argument("--data", default=str(DEFAULT_CACHE))
+    mc.add_argument("--csv", help="真实行情 CSV（不启用 Qlib，也没有回测工具）")
+    mc.add_argument("--registry", default=str(ROOT / "factors"))
+    mc.add_argument("--experience", default=str(ROOT / "runs" / "experience.jsonl"))
+    mc.add_argument("--runs", default=str(ROOT / "runs"))
+    mc.add_argument("--no-qlib", action="store_true")
     sv = sub.add_parser("serve", help="本地前端：运行记录、审计轨迹、因子库、模型、模拟账户；可发起研究运行")
     sv.add_argument("--host", default="127.0.0.1")
     sv.add_argument("--port", type=int, default=8765)
@@ -546,6 +555,11 @@ def main(argv=None):
         return res
     if args.cmd == "reports":
         return cmd_reports(args)
+    if args.cmd == "mcp":
+        from .mcp_server import Tools, serve
+        df, risk = (load_csv_panel(args.csv), None) if args.csv else load_hs300(Path(args.data))
+        registered = FactorRegistry(Path(args.registry)).compute(df) if not args.csv else {}
+        return serve(Tools(df, risk, args.role, args.experience, args.runs, extra_library=registered))
     if args.cmd == "serve":
         from .web import serve
         return serve(args.host, args.port)

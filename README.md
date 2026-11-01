@@ -59,6 +59,7 @@ QH_ENV_FILE=path/to/.env .venv/bin/python -m qharness serve
 | `run --report 研报.md` / `--hypothesis h.json` | 研报 → 假设 → 实验循环 → 策略对照 → 通过且测试段成立的因子登记 | `runs/<run_id>/`：`summary.md`、`trace.jsonl`、`results.json`、`strategy.json`、`llm_calls.json` |
 | `demo` | 用 `samples/` 里的示例研报跑 `run` | 同上 |
 | `update` | 刷新最新沪深 300 成分；新成分股补全历史；已有股票追加最近交易日；有 Qlib 目录时一并重新生成 | `data/hs300/`、`data/qlib_cn/` |
+| `mcp --role coder\|research` | MCP 服务（stdio）：沙箱、经验检索；`research` 多一个验证段回测。不开放测试段和因子登记 | `runs/mcp/<启动编号>/trace.jsonl` |
 | `qlib-dump` | 行情缓存转成 Qlib 数据目录（之后 `run` / `daily` 自动启用 Qlib，`--no-qlib` 关闭） | `data/qlib_cn/` |
 | `qlib-train` | Qlib 模型训练：Alpha158 特征 + 梯度提升树，沿用 Harness 的切分和测试段纪律，和 5 个基础因子的等权基线比较（`--with-registry` 把 Qlib 表达式写的登记因子加进特征；`--walk-forward` 按季度滚动训练、样本外拼接评估） | `runs/qlib_model/<时间>/`：`summary.json`、`pred.pkl`、`mlruns/` |
 | `daily` | 因子库 + 登记因子等权合成，在最新成分里选 TopK，对比上次持仓给出买卖清单 | `portfolio/<日期>.csv` |
@@ -407,6 +408,7 @@ FastAPI（`qharness/web.py`）+ React（`web/`，Vite + TypeScript）。后端�
 | 前端 | `web.py`：只读接口 + 白名单任务（研究运行、每日任务）；路径和上传校验；`web/` 的 React 页面 | `test_web_api_reads_runs_and_guards_paths` |
 | 滚动训练 | `qlib_model.folds` / `walk_forward`：扩张或固定窗口，训练 / 验证 / 预测间隔 embargo，逐折和整体样本外评估 | `test_walk_forward_folds_have_embargo`、`test_walk_forward_runs_and_locks_test` |
 | 投入使用 | `daily_job.py`（幂等、按北京时间、失败续做）、`monitor.py`（衰减监控与自动停用）、`schedule.py`（launchd） | `test_daily_job_idempotent_and_resumes`、`test_monitor_deactivates_decayed_factor` |
+| MCP 服务 | `mcp_server.py`：按角色开放工具；只给验证段结束之前的数据；回测次数按因子值落盘 | `test_mcp_coder_has_no_backtest_or_test_access`、`test_mcp_experience_filtered_by_role`、`test_mcp_backtest_limit_survives_restart_and_rewrites`、`test_mcp_stdio_end_to_end` |
 | 候选并行 | `FactorHarness.run(workers=N)`：线程池；共享状态加锁；trace 带候选标签 | `test_duplicate_check_is_atomic_across_threads`、`test_tracer_tags_events_per_thread`、`test_parallel_candidates_real_model` |
 | 去重 | `orchestrator.factor_key`（同一因子才跳过已淘汰方向）、`_duplicate_of`（按因子值） | `test_factor_key_same_factor_only`、`test_duplicate_by_values` |
 
@@ -521,6 +523,27 @@ QH_ENV_FILE=path/to/.env .venv/bin/python -m pytest -q
 - **盘前**：`daily-job` 按北京时间分两段。16:00 之后更新行情、财务估值和监控；09:30 之前结算、算目标组合、挂单，当天开盘撮合，只用前一交易日及以前的数据。过了 09:30 不补算。
 - **研究层回测工具** `run_qlib_backtest`：候选在训练段和验证段方向都对时，研究层自己选持仓只数和调仓间隔，最多调用 2 次。只在验证段，结果写进诊断和 trace，通过与否仍由规则决定；写代码的一层拿不到这个工具。
 - **任意区间对比** `qharness strategy-compare --months 6`：最近六个月（2026-04-23 ~ 10-22）基线年化超额 −3.85%，加入 EP 后 +6.94%；Qlib 复核 −0.27% → +9.87%。这段在已打开过的测试段之内，不是新的独立证据。
+
+## MCP 服务
+
+`qharness mcp` 用官方 SDK 把工具开放给外部 MCP 客户端，只走本机 stdio。内部的 LangGraph 流程仍然直接调用函数，不走 MCP。
+
+| 工具 | coder | research | 返回 |
+|---|---|---|---|
+| `run_factor` / `run_qlib_factor`（Qlib 工具要有数据目录） | 有 | 有 | 执行状态、报错、口径检查，没有收益指标 |
+| `search_experience` | 成功实现、修复案例 | 再加被淘汰的方向、纠正记录 | 命中的经验 |
+| `run_validation_backtest` | 无 | 有（要有 Qlib 数据） | 验证段上基线和基线 + 候选的超额、信息比率、回撤、换手 |
+
+- **测试段**：没有打开测试段和登记因子的工具；因子代码只拿到验证段结束之前的数据（实测最大日期 2026-01-21，测试段从 01-22 开始），报错信息也带不出测试段。
+- **回测次数**：每个因子最多 2 次，和研究层内部的上限一致。按因子值认身份并落盘，改写法、翻方向、重启服务都不能多跑；持仓只数和调仓间隔的范围写在工具 schema 里。
+- **结果用途**：这里的结果不进入判定，也不算入多重检验的试验次数。
+- **局限**：沙箱是静态检查、受限内置函数加子进程资源上限，不是操作系统级隔离，只适合本机使用；服务没有鉴权；coder 拿不到指标工具，但能读到训练和验证段行情，隔离防的是无意的过拟合，不防有意绕过。还没有接过第三方客户端，只用 SDK 自带的客户端验证过。
+
+客户端配置示例（路径换成项目目录）：
+
+```json
+{"mcpServers": {"qharness": {"command": "<项目目录>/.venv/bin/python", "args": ["-m", "qharness", "mcp", "--role", "coder"], "cwd": "<项目目录>"}}}
+```
 
 ## Agent 运行指标
 

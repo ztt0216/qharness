@@ -167,10 +167,10 @@ class Evaluator:
             "valid": self._segment_metrics(fw, segment_dates(self.df, self.split.valid), raw),
         }
 
-    def _value_keys(self, factor: pd.Series) -> list[str]:
-        """按因子值认身份：测试段每天的截面分位数（保留 4 位）+ 数据范围。分位数对单调变换不变（2×EP、EP+常数是同一个因子），
+    def _value_keys(self, factor: pd.Series, seg: tuple[pd.Timestamp, pd.Timestamp] | None = None) -> list[str]:
+        """按因子值认身份：测试段（或 seg 指定的段）每天的截面分位数（保留 4 位）+ 数据范围。分位数对单调变换不变（2×EP、EP+常数是同一个因子），
         取反后的分位数是 1 − 原值，一起锁上：看过测试段之后不能翻个方向再开一次。换了数据范围（比如扩大股票池）算新的测试。"""
-        d = segment_dates(self.df, self.split.test)
+        d = segment_dates(self.df, seg or self.split.test)
         w = _wide(factor.reindex(self.df.index)).loc[d]
         r = ((w.rank(axis=1) - 0.5).div(w.count(axis=1), axis=0)).round(4)  # (名次 − 0.5) / n：取反后正好是 1 − 原值
         sig = f"{d[0].date()}|{d[-1].date()}|{w.shape[1]}|".encode()
