@@ -7,6 +7,7 @@
   python -m qharness daily                        因子库 + 登记因子 → 下一交易日目标持仓与买卖清单
   python -m qharness factors                      查看登记因子
   python -m qharness eval-research --env-file .env  研究层评测集
+  python -m qharness eval-coder --env-file .env   实验层评测集：四层判分 + 经验库开关对照
   python -m qharness experience                   查看经验库
   python -m qharness mcp --role coder             MCP 服务（stdio）：沙箱、经验检索、验证段回测
 """
@@ -519,6 +520,16 @@ def main(argv=None):
     sc = sub.add_parser("schedule", help="定时运行每日任务（macOS launchd）")
     sc.add_argument("action", choices=["install", "status", "uninstall"])
     sc.add_argument("--dry-run", action="store_true", help="install：只显示要写入的配置，不安装")
+    ec = sub.add_parser("eval-coder", help="实验层评测集：四层判分（执行、结构、未来函数、和参考实现比对）+ 经验库开关对照")
+    ec.add_argument("--llm", choices=["anthropic", "openai"], default="anthropic")
+    ec.add_argument("--env-file")
+    ec.add_argument("--data", default=str(DEFAULT_CACHE))
+    ec.add_argument("--experience", default=str(ROOT / "runs" / "experience.jsonl"), help="on 组从这份经验库的副本开始，原文件不会被改")
+    ec.add_argument("--out", default=str(ROOT / "runs" / "coder_eval"))
+    ec.add_argument("--trials", type=int, default=3)
+    ec.add_argument("--arms", default="off,on")
+    ec.add_argument("--cases", help="只跑这些题（逗号分隔的题名），试跑时用")
+    ec.add_argument("--workers", type=int, default=6)
     r = sub.add_parser("eval-research")
     r.add_argument("--llm", choices=["anthropic", "openai"], default="anthropic")
     r.add_argument("--env-file")
@@ -614,6 +625,17 @@ def main(argv=None):
             print(f"[{'启用' if x.get('active', True) else '停用'}] {x['name']}  测试段 RankIC {t.get('rank_ic')}  "
                   f"t {t.get('rank_ic_t_nw')}  来自 {x['run_id']}")
         return None
+    if args.cmd == "eval-coder":
+        from .coder_eval import CASES, run_eval
+        from .data import research_data
+        if args.env_file:
+            load_env_file(args.env_file)
+        df, _ = load_hs300(Path(args.data))
+        names = set(args.cases.split(",")) if args.cases else None
+        report = run_eval(lambda: make_llm(args.llm), research_data(df), args.experience, args.out, trials=args.trials,
+                          arms=tuple(args.arms.split(",")), cases=[c for c in CASES if not names or c.name in names], workers=args.workers)
+        print(json.dumps({k: report[k] for k in ("trials", "excluded", "by_arm", "experience_on_minus_off")}, ensure_ascii=False, indent=2))
+        return report
     if args.cmd == "eval-research":
         from .research_eval import run_eval
         if args.env_file:

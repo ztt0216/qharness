@@ -74,6 +74,7 @@ QH_ENV_FILE=path/to/.env .venv/bin/python -m qharness serve
 | `monitor` | 因子衰减监控：最近 120 个有标签的交易日重新评估，失效的登记因子自动停用（`--dry-run` 只报告） | `runs/monitor/<日期>.json` |
 | `factors --activate` / `--deactivate` | 人工启用 / 停用登记因子，记进登记表的历史 | `factors/*.json` |
 | `factors` | 查看登记因子（代码、各段指标、来源 run） | — |
+| `eval-coder` | 实验层评测集：四层判分（执行、结构、未来函数、和参考实现比对）+ 经验库开关对照 | `runs/coder_eval/report.json`、`trials.jsonl` |
 | `eval-research` | 研究层评测集打分 | `runs/research_eval.json` |
 | `experience` | 查看经验库 | — |
 
@@ -408,6 +409,7 @@ FastAPI（`qharness/web.py`）+ React（`web/`，Vite + TypeScript）。后端�
 | 前端 | `web.py`：只读接口 + 白名单任务（研究运行、每日任务）；路径和上传校验；`web/` 的 React 页面 | `test_web_api_reads_runs_and_guards_paths` |
 | 滚动训练 | `qlib_model.folds` / `walk_forward`：扩张或固定窗口，训练 / 验证 / 预测间隔 embargo，逐折和整体样本外评估 | `test_walk_forward_folds_have_embargo`、`test_walk_forward_runs_and_locks_test` |
 | 投入使用 | `daily_job.py`（幂等、按北京时间、失败续做）、`monitor.py`（衰减监控与自动停用）、`schedule.py`（launchd） | `test_daily_job_idempotent_and_resumes`、`test_monitor_deactivates_decayed_factor` |
+| 实验层评测 | `coder_eval.py`：参考实现比对、四层判分、经验库开关对照、按题配对 bootstrap | `test_coder_eval_references_pass_all_layers`、`test_coder_eval_grader_rejects_wrong_answers`、`test_coder_eval_traps_catch_naive_code`、`test_coder_eval_paired_diff_counts_cases_not_trials` |
 | MCP 服务 | `mcp_server.py`：按角色开放工具；只给验证段结束之前的数据；回测次数按因子值落盘 | `test_mcp_coder_has_no_backtest_or_test_access`、`test_mcp_experience_filtered_by_role`、`test_mcp_backtest_limit_survives_restart_and_rewrites`、`test_mcp_stdio_end_to_end` |
 | 候选并行 | `FactorHarness.run(workers=N)`：线程池；共享状态加锁；trace 带候选标签 | `test_duplicate_check_is_atomic_across_threads`、`test_tracer_tags_events_per_thread`、`test_parallel_candidates_real_model` |
 | 去重 | `orchestrator.factor_key`（同一因子才跳过已淘汰方向）、`_duplicate_of`（按因子值） | `test_factor_key_same_factor_only`、`test_duplicate_by_values` |
@@ -549,7 +551,30 @@ QH_ENV_FILE=path/to/.env .venv/bin/python -m pytest -q
 
 `qharness agent-stats` 从 `runs/*/trace.jsonl` 和 `llm_calls.jsonl` 统计，结果写到 `runs/agent_stats.json`。这是开发过程的记录，不是对照实验。
 
-31 次运行：因子实现 74 次，第一次执行通过 67 次（90.5%），需要修复 7 次、修复成功 6 次，最终跑通 73 次（98.6%）；候选 91 个，通过 1 个（手写的 EP）；经验检索命中 51/74。13 次有用量记录的运行共约 18.8 万 token。经验库没有做过开关对照，不能说明它减少了修复。
+31 次运行：因子实现 74 次，第一次执行通过 67 次（90.5%），需要修复 7 次、修复成功 6 次，最终跑通 73 次（98.6%）；候选 91 个，通过 1 个（手写的 EP）；经验检索命中 51/74。13 次有用量记录的运行共约 18.8 万 token。经验库的开关对照见「实验层评测集结果」，没有看到提升。
+
+## 实验层评测集结果
+
+`qharness eval-coder`：30 道题（基础、中等、困难各 8 道，陷阱 6 道），每题有人工写的参考实现。全部用代码判分，分执行、结构、未来函数、功能四层，思路借鉴 [AlphaQT-Bench](https://aclanthology.org/2026.findings-acl.138.pdf)。只用 2026-01-21（验证段结束）之前的数据，不碰测试段。经验库开和关各跑 3 轮，每版 180 次试验，用真实模型。
+
+| 轮次 | 改动 | 四层全过（关 / 开） | 跑通但算错（关 / 开） | 开 − 关（95% 区间，按题配对） |
+|---|---|---|---|---|
+| v1 | 原始题目 | 90.0% / 91.1% | 10.0% / 8.9% | +1.1%（−6.7% ~ +8.9%） |
+| v2 | 修正 3 道有歧义的题 | 93.3% / 93.3% | 6.7% / 6.7% | 0（−3.3% ~ +3.3%） |
+| **v3（当前）** | 修复 Qlib 窗口写法和提示词 | **97.8% / 94.4%** | **1.1% / 5.6%** | **−3.3%（−8.9% ~ 0）** |
+
+v3 的其他指标：最终跑通 98.9% / 100%；第一次执行通过 87.8% / 88.9%；平均修复 0.167 / 0.144 次；每次试验 2088 / 2780 token（开多 692，+410 ~ +1027）。v3 共约 43.8 万 token。
+
+- **跑通不等于算对：** v2 的跑通率 100%，仍有 6.7% 算错，所有执行检查都拦不住。
+- **经验库三轮都没有带来可见提升，还多花约 33% 的 token。** 这里的成功经验都经过参考实现验证，已经是偏乐观的设定。关闭时通过率本来就高，所以这个结论只限这批题。
+- **经验可能误导：** `历史价格分位` 检索到相似的 `时序分位` 成功实现后写成 60 日窗口，v2、v3 开启时各错 1 次，关闭时全对。
+- **评测驱动的修复：** 模型把 Qlib 的滚动算子 `Min(x,0)` 当成逐元素取小，算错却不报错。现在表达式检查拒绝小于 1 的窗口（EMA 的 0~1 平滑系数除外）。只拒绝还不够：模型接着把 `Less(x,0)` 当布尔值，写成 `Less(x,0)*x`。提示词说明 `Less` 返回值后，`下行波动` 从 1/6 变成 6/6。这条提示几乎等于这道题的答案，所以这道题的提升不能当成泛化能力。
+- **v3 剩余的失败（7 次）：**
+  - `特质波动`（4 次）：3 次把回归简化成 `收益 − 市场`，1 次循环写法修了 3 次仍没跑通。v3 比 v2 的 0/6 好，这道题没有改动，只能算波动。
+  - `高波动反转`（2 次，只在经验库开启时）：用 Qlib 的 `Med` 当截面中位数，它其实是时序算子。之前两轮没有出现，还没有修。
+  - `历史价格分位`（1 次）：上面说的经验误导。
+- **判分器验证：** 测试覆盖参考实现全部通过、方向反了和少一半股票被判错、陷阱题的直接写法被拦。v3 通过的秩相关最低 0.9998，失败的最高 0.9734，没有卡在阈值 0.99 附近。
+- **局限：** 只测了一个模型；题目和参考实现都是自己写的；每轮之间模型本身也有波动，v1 到 v3 的变化不全是改动带来的；提示词是看过这批题后改的，97.8% 偏乐观；秩相关对单调变换不敏感，`EP截面缩尾` 这类题主要靠未来函数检查；题目描述比真实研报里的假设明确。
 
 ## 已知局限
 

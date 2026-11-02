@@ -27,6 +27,10 @@ ENV_URI = "QH_QLIB_URI"
 OPS = {"Ref", "Mean", "Std", "Var", "Skew", "Kurt", "Max", "Min", "IdxMax", "IdxMin", "Med", "Mad", "Rank", "Count",
        "Delta", "Slope", "Rsquare", "Resi", "WMA", "EMA", "Sum", "Corr", "Cov", "Abs", "Sign", "Log", "Power", "If",
        "Gt", "Lt", "Ge", "Le", "Eq", "Ne", "And", "Or", "Not", "Greater", "Less", "Quantile"}
+# 窗口参数的位置。Qlib 里 N=0 是全样本累积，Min(x,0) 这样的写法能跑通但结果不对（模型常把它当成逐元素取小）
+WINDOW_ARG = {**dict.fromkeys(("Mean", "Std", "Var", "Skew", "Kurt", "Max", "Min", "IdxMax", "IdxMin", "Med", "Mad", "Rank", "Count",
+                               "Delta", "Slope", "Rsquare", "Resi", "WMA", "EMA", "Sum", "Quantile"), 1),
+              "Corr": 2, "Cov": 2}
 TOKEN = re.compile(r"\s*(?:(\$[a-z_]+)|([A-Za-z_][A-Za-z0-9_]*)|(\d+\.?\d*(?:e-?\d+)?)|(==|!=|>=|<=|[-+*/(),<>&|~]))")
 FIELD_LIMIT_UP, FIELD_LIMIT_DOWN = "limit_up", "limit_down"
 
@@ -144,6 +148,18 @@ def check_expr(expr: str, fields: list[str]) -> str | None:
                     return f"Ref 的偏移 {args[1].strip()} 为负：用到了未来数据"
             except ValueError:
                 return "Ref 的偏移必须是常数"
+    for m in re.finditer(rf"\b({'|'.join(WINDOW_ARG)})\s*\(", expr):
+        name, args = m.group(1), _top_args(expr, m.end())
+        if len(args) <= WINDOW_ARG[name]:
+            continue  # 参数个数不对，交给 Qlib 报错
+        window = args[WINDOW_ARG[name]].strip()
+        try:
+            bad = float(window) <= 0 if name == "EMA" else float(window) < 1  # EMA 的 N 可以是 0~1 的平滑系数
+        except ValueError:
+            bad = True
+        if bad:
+            hint = "；逐元素取两者中较小 / 较大的值用 Less(x,y) / Greater(x,y)，返回的是值不是布尔" if name in ("Min", "Max") else ""
+            return f"{name} 的窗口 {window} 不合法：必须是正数常数{hint}；要用全部历史就改用 run_factor"
     return None
 
 

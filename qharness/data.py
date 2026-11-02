@@ -87,6 +87,12 @@ def make_split(df: pd.DataFrame, ratios=(0.6, 0.2, 0.2)) -> Split:
     return Split((dates[0], dates[a - 1]), (dates[a], dates[b - 1]), (dates[b], dates[-1]))
 
 
+def research_data(df: pd.DataFrame) -> pd.DataFrame:
+    """验证段结束之前的数据：外部入口和评测集都只在这上面算，碰不到测试段。"""
+    df = df.sort_index()
+    return df.loc[df.index.get_level_values("datetime") <= make_split(df).valid[1]]
+
+
 def segment_dates(df: pd.DataFrame, seg: tuple[pd.Timestamp, pd.Timestamp]) -> pd.DatetimeIndex:
     """段内日期，去掉末尾 EMBARGO 天（标签会看到下一段的价格）。"""
     dates = df.index.get_level_values("datetime").unique().sort_values()

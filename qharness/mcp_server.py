@@ -20,7 +20,7 @@ from pydantic import Field
 
 from . import qlib_bridge as qb
 from .agents import MAX_BACKTESTS, RUN_FACTOR_TOOL, RUN_QLIB_TOOL, tool_view
-from .data import make_split
+from .data import research_data
 from .evaluate import Evaluator
 from .experience import ExperienceStore
 from .sandbox import execute_factor, with_direction
@@ -29,11 +29,6 @@ from .trace import Tracer
 
 CODER_KINDS = ("success", "fix")
 RESEARCH_KINDS = ("success", "fix", "rejected", "corrected")
-
-
-def research_data(df: pd.DataFrame) -> pd.DataFrame:
-    """验证段结束之前的数据：对外的工具都只在这上面算。"""
-    return df.loc[df.index.get_level_values("datetime") <= make_split(df.sort_index()).valid[1]]
 
 
 class Tools:

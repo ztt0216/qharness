@@ -556,6 +556,19 @@ def test_qlib_expression_static_rules(df, qlib_env):
     assert execute_factor("QLIB:Mean($vwap,5)", df).error_type == ErrorType.FORBIDDEN  # 不在行情字段里
 
 
+def test_qlib_rejects_bad_windows(df, qlib_env):
+    """Min(x,0) 在 Qlib 里能跑通但是全样本累积；模型常把它当成逐元素取小，算错却不报错。"""
+    from qharness import qlib_bridge as qb
+
+    r = execute_factor("QLIB:Sum(Power(Min($close/Ref($close,1)-1,0),2),20)", df)
+    assert r.error_type == ErrorType.FORBIDDEN and "Less" in r.message
+    for bad in ("Max($close,$open)", "Mean($close,0)", "Sum($close,-5)", "Corr($close,$volume,0)", "EMA($close,0)", "Quantile($close,0,0.5)"):
+        assert qb.check_expr(bad, ["close", "open", "volume"]), bad
+    for ok in ("Mean($close,5)", "Rank($close,60)", "Corr($close,$volume,10)", "EMA($close,0.5)", "Quantile($close,20,0.5)",
+               "Less($close,0)", "Greater($close,$open)", "Ref($close,0)", "If($close>0,Mean($close,5),0)", "Mean(Less($close,0),5)"):
+        assert qb.check_expr(ok, ["close", "open", "volume"]) is None, ok
+
+
 def test_qlib_rejects_stale_data(df, risk, tmp_path, monkeypatch):
     """Qlib 目录和当前行情不是同一份（比如 update 后没重新 dump）：报错，不静默算出另一份数。"""
     from qharness import qlib_bridge as qb
@@ -1257,3 +1270,64 @@ def test_mcp_stdio_end_to_end(tmp_path):
     names, res = anyio.run(go)
     assert names == {"run_factor", "search_experience"}  # CSV 模式没有 Qlib 工具
     assert res.structured_content["ok"], res.structured_content
+
+
+# ---------------------------------------------------------------- 实验层评测集：先证明判分器本身可信
+
+def _coder_refs(df):
+    from qharness.coder_eval import available_cases
+    from qharness.data import research_data
+
+    data = research_data(df)
+    cases = available_cases(data)
+    return data, cases, {c.name: execute_factor(c.reference, data) for c in cases}
+
+
+def test_coder_eval_references_pass_all_layers(df):
+    from qharness.coder_eval import compare
+
+    _, cases, refs = _coder_refs(df)
+    assert len(cases) >= 20
+    for c in cases:
+        res = refs[c.name]
+        assert res.ok, (c.name, res.error_type, res.message[:300])
+        assert compare(res.values, res.values)["match"], c.name
+
+
+def test_coder_eval_grader_rejects_wrong_answers(df):
+    from qharness.coder_eval import compare
+
+    data, cases, refs = _coder_refs(df)
+    for c in cases:
+        v = refs[c.name].values
+        assert not compare(-v, v)["match"], c.name  # 方向反了
+        sparse = v.where(v.index.get_level_values("instrument").isin(v.index.get_level_values("instrument").unique()[::2]))
+        assert not compare(sparse, v)["match"], c.name  # 少了一半股票
+    names = {c.name: refs[c.name].values for c in cases}
+    assert not compare(names["5日反转"], names["20日动量"])["match"]  # 窗口和方向都不对
+    assert not compare(names["20日波动率"], names["下行波动"])["match"]  # 算法相近但不同的因子
+    assert not compare(names["相对历史均量"], names["量比"])["match"]
+
+
+def test_coder_eval_traps_catch_naive_code(df):
+    """陷阱题的直接写法要被未来函数或行序检查抓住；否则这道题测不到东西。"""
+    from qharness.data import research_data
+
+    data = research_data(df)
+    naive = {
+        "相对历史均量": "def factor(df):\n    v = df['volume']\n    return v / v.groupby(level='instrument').transform('mean')",
+        "历史价格分位": "def factor(df):\n    return df['close'].groupby(level='instrument').rank(pct=True)",
+        "停牌填充动量": "def factor(df):\n    c = df['close'].ffill()\n    return c / c.groupby(level='instrument').shift(20) - 1",
+        "收益历史标准分": "def factor(df):\n    c = df['close']\n    g = c.groupby(level='instrument')\n    r = c / g.shift(1) - 1\n    h = r.groupby(level='instrument')\n    return (r - h.transform('mean')) / h.transform('std')",
+    }
+    for name, code in naive.items():
+        r = execute_factor(code, data)
+        assert not r.ok and r.error_type in (ErrorType.LOOKAHEAD, ErrorType.ORDER_DEPENDENT), (name, r.error_type)
+
+
+def test_coder_eval_paired_diff_counts_cases_not_trials():
+    from qharness.coder_eval import paired_diff
+
+    rows = [{"case": c, "arm": a, "trial": t, "passed": a == "on"} for c in "abcd" for a in ("on", "off") for t in range(3)]
+    d = paired_diff(rows, "passed")
+    assert d["cases"] == 4 and d["diff"] == 1.0 and d["ci95"] == [1.0, 1.0]

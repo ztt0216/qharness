@@ -72,6 +72,7 @@ QLIB_HELP = """Qlib 表达式（run_qlib_factor）：
 - 字段写成 {fields}；算子：Ref(x,n)（n 天前，n 必须 ≥ 0）、Mean/Std/Var/Skew/Sum/Max/Min/Med/Rank/Slope/Rsquare/Resi/WMA/EMA(x,n)、
   Corr/Cov(x,y,n)、Delta(x,n)、Abs/Sign/Log(x)、Power(x,p)、If(cond,a,b)、Greater/Less(x,y)，以及 + - * / > < 等
 - 窗口算子都是按股票的时间序列计算（Rank 是时序分位，不是截面排名）；窗口不足时用已有数据
+- Max/Min(x,n) 是滚动窗口，n 必须是正数常数。Greater(x,y) / Less(x,y) 返回两者中较大 / 较小的值，不是布尔值：min(x,0) 写成 Less(x,0)，不要再乘 x；比较大小用 x>y、x<y
 - 例：5日反转 -($close/Ref($close,5)-1)；20日波动 Std($close/Ref($close,1)-1,20)；量价相关 Corr($close,$volume,10)"""
 RUN_QLIB_TOOL = {
     "name": "run_qlib_factor",

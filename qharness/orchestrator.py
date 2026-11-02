@@ -89,6 +89,22 @@ def hypothesis_text(h: dict) -> str:
     return f"{h.get('name', '')} {h.get('calculation', '')} 字段{','.join(h.get('fields', []))} 窗口{h.get('window')}"
 
 
+def retrieve_experiences(store: ExperienceStore, h: dict, error_type: str | None = None) -> list[dict]:
+    q = hypothesis_text(h)
+    hits = store.search(q, kind="success", k=1) + store.search(q, kind="fix", k=2)
+    if error_type:
+        hits += store.search(q, kind="fix", error_type=error_type, k=2)
+    seen, out = set(), []
+    for s, e in sorted(hits, key=lambda x: -x[0]):
+        if e.kind == "success" and not e.content.get("direction_by_harness"):
+            continue  # 旧口径的成功实现里方向是模型自己处理的，照抄会把方向算两遍
+        key = (e.kind, e.task, e.error_type, e.ts)
+        if key not in seen:
+            seen.add(key)
+            out.append({"kind": e.kind, "task": e.task, "error_type": e.error_type, "content": e.content, "score": s})
+    return out[:3]
+
+
 class FactorHarness:
     def __init__(self, llm: LLM, evaluator: Evaluator, store: ExperienceStore, tracer: Tracer,
                  limits: Limits = Limits(), thresholds: Thresholds = Thresholds(), checkpointer=None,
@@ -123,19 +139,7 @@ class FactorHarness:
         return None
 
     def _experiences(self, h: dict, error_type: str | None = None) -> list[dict]:
-        q = hypothesis_text(h)
-        hits = self.store.search(q, kind="success", k=1) + self.store.search(q, kind="fix", k=2)
-        if error_type:
-            hits += self.store.search(q, kind="fix", error_type=error_type, k=2)
-        seen, out = set(), []
-        for s, e in sorted(hits, key=lambda x: -x[0]):
-            if e.kind == "success" and not e.content.get("direction_by_harness"):
-                continue  # 旧口径的成功实现里方向是模型自己处理的，照抄会把方向算两遍
-            key = (e.kind, e.task, e.error_type, e.ts)
-            if key not in seen:
-                seen.add(key)
-                out.append({"kind": e.kind, "task": e.task, "error_type": e.error_type, "content": e.content, "score": s})
-        return out[:3]
+        return retrieve_experiences(self.store, h, error_type)
 
     def _same_rejected(self, h: dict) -> Experience | None:
         """只跳过算出来是同一个因子的假设。文本相似不够：公式里共用 rolling(20).max() 的两个因子可以完全不同；
